@@ -1,0 +1,88 @@
+name: release
+
+# Cut a release by pushing a tag whose version matches Cargo.toml:
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# The build job compiles the binary and creates a GitHub release.
+# The aur job then updates the `dictationapp` and `dictationapp-bin`
+# AUR packages. It is skipped silently unless the AUR_SSH_PRIVATE_KEY
+# secret is set — see "Releasing" in README.md for the one-time setup.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build and release
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $ver — bump it first"
+            exit 1
+          fi
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake clang \
+            libasound2-dev libfontconfig-dev libfreetype-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb1-dev libxcb-xkb-dev libxau-dev libxdmcp-dev libvulkan-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf "dist/dictationapp-${GITHUB_REF_NAME}-x86_64-linux-gnu.tar.gz" \
+            -C target/release dictationapp \
+            -C "$GITHUB_WORKSPACE" LICENSE README.md
+          (cd dist && sha256sum *.tar.gz > sha256sums.txt)
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+
+  aur:
+    name: Publish to AUR
+    needs: build
+    runs-on: ubuntu-latest
+    # makepkg only runs on Arch — use the base-devel image (includes
+    # pacman, makepkg, and the toolchain needed for .SRCINFO).
+    container: archlinux:base-devel
+    env:
+      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+      AUR_USERNAME: ${{ secrets.AUR_USERNAME }}
+      AUR_EMAIL: ${{ vars.AUR_EMAIL }}
+    steps:
+      - name: Install tools
+        run: pacman -Sy --noconfirm --needed git openssh curl
+
+      - uses: actions/checkout@v4
+
+      - name: Publish packages
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: bash packaging/aur/publish.sh

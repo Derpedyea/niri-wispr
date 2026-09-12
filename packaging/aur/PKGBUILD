@@ -1,0 +1,42 @@
+# Maintainer: Derpedyea <derped@mineperial.com>
+pkgname=dictationapp
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="Wispr Flow-style push-to-talk dictation for Wayland/niri"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Derpedyea/niri-wispr"
+license=('MIT')
+depends=(
+  'glibc'
+  'gcc-libs'
+  'alsa-lib'
+  'libxcb'
+  'libxau'
+  'libxdmcp'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'wayland'
+  'fontconfig'
+)
+makedepends=('cargo' 'pkgconf')
+optdepends=(
+  'niri: positions the pill at the bottom-center of the output'
+  'pipewire: audio cues via pw-play'
+  'libpulse: audio cues via paplay'
+  'alsa-utils: audio cues via aplay'
+)
+source=("$pkgname-$pkgver.tar.gz::https://github.com/Derpedyea/niri-wispr/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  # The GitHub source tarball extracts to the repo name, not the package name.
+  cd "niri-wispr-$pkgver"
+  export CARGO_TARGET_DIR=target
+  cargo build --release --locked
+}
+
+package() {
+  cd "niri-wispr-$pkgver"
+  install -Dm755 target/release/dictationapp "$pkgdir/usr/bin/dictationapp"
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+}

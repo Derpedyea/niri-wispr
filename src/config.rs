@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 pub const DEFAULT_MODEL: &str = "fish-audio/transcribe-1";
-pub const DEFAULT_CLEANUP_MODEL: &str = "google/gemini-2.5-flash-lite";
+pub const DEFAULT_CLEANUP_MODEL: &str = "inclusionai/ling-3.0-flash";
 pub const DEFAULT_HOTKEY: &str = "KEY_RIGHTCTRL";
 
 #[derive(Debug, Default, Deserialize)]

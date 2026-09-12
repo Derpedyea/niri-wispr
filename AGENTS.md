@@ -12,6 +12,18 @@ cargo test                     # unit tests (evdev round-trip needs /dev/uinput 
 cargo test -- --ignored        # network test (needs OPENROUTER_API_KEY + /tmp/speech.wav)
 ```
 
+## Releasing
+
+Push a `v*` tag matching Cargo.toml's version → `.github/workflows/release.yml`
+builds on ubuntu-22.04, creates a GitHub release (x86_64 tarball + checksums),
+then the `aur` job runs `packaging/aur/publish.sh` inside `archlinux:base-devel`
+to update the `dictationapp` + `dictationapp-bin` AUR packages (clone or init
+repo, fill pkgver/sha256, `makepkg --printsrcinfo` as unprivileged `builder`,
+push to master). Skipped unless `AUR_SSH_PRIVATE_KEY` secret is set; optional
+`AUR_USERNAME`/`AUR_EMAIL` set the AUR commit identity. PKGBUILD templates live
+in `packaging/aur/` (MIT licensed — LICENSE ships in both packages and in the
+release tarball).
+
 Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, errors).
 
 ## Architecture
@@ -37,7 +49,7 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
   speech model, language, hotkey, mode, output, sound, and transcript cleanup. Save writes
   config.toml and sends `Command::Reload` — the pill hot-reloads.
 - `config.rs` — `~/.config/dictationapp/config.toml` (+ `OPENROUTER_API_KEY` env wins).
-  `cleanup` defaults to true and `cleanup_model` defaults to `google/gemini-2.5-flash-lite`.
+  `cleanup` defaults to true and `cleanup_model` defaults to `inclusionai/ling-3.0-flash`.
   Note: honors XDG_CONFIG_HOME first, falls back to `~/.config` — T3 Code shells override XDG.
 
 ## System integration (niri)

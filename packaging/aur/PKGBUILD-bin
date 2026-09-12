@@ -1,0 +1,35 @@
+# Maintainer: Derpedyea <derped@mineperial.com>
+pkgname=dictationapp-bin
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="Wispr Flow-style push-to-talk dictation for Wayland/niri (prebuilt binary)"
+arch=('x86_64')
+url="https://github.com/Derpedyea/niri-wispr"
+license=('MIT')
+provides=('dictationapp')
+conflicts=('dictationapp')
+depends=(
+  'glibc'
+  'gcc-libs'
+  'alsa-lib'
+  'libxcb'
+  'libxau'
+  'libxdmcp'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'wayland'
+  'fontconfig'
+)
+optdepends=(
+  'niri: positions the pill at the bottom-center of the output'
+  'pipewire: audio cues via pw-play'
+  'libpulse: audio cues via paplay'
+  'alsa-utils: audio cues via aplay'
+)
+source=("dictationapp-v$pkgver-x86_64-linux-gnu.tar.gz::https://github.com/Derpedyea/niri-wispr/releases/download/v$pkgver/dictationapp-v$pkgver-x86_64-linux-gnu.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  install -Dm755 dictationapp "$pkgdir/usr/bin/dictationapp"
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+}
