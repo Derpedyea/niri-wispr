@@ -31,5 +31,6 @@ sha256sums=('SKIP')
 
 package() {
   install -Dm755 dictationapp "$pkgdir/usr/bin/dictationapp"
+  install -Dm644 packaging/dictationapp-settings.desktop -t "$pkgdir/usr/share/applications/"
   install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
 }

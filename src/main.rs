@@ -37,9 +37,9 @@ fn usage() -> ! {
 }
 
 /// Headless capture test: `dictationapp --record 5 /tmp/out.wav`
-fn record_wav(secs: f32, out: &str) -> anyhow::Result<()> {
+fn record_wav(secs: f32, out: &str, mic: Option<&str>) -> anyhow::Result<()> {
     eprintln!("recording {secs:.1}s — speak now");
-    let rec = audio::start()?;
+    let rec = audio::start(mic)?;
     std::thread::sleep(std::time::Duration::from_secs_f32(secs));
     let (samples, rate) = rec.finish();
     let peak = samples.iter().fold(0.0f32, |a, &s| a.max(s.abs()));
@@ -64,7 +64,8 @@ fn main() {
                 eprintln!("usage: dictationapp --record <out.wav> [secs]");
                 std::process::exit(2);
             };
-            if let Err(e) = record_wav(secs, out) {
+            let mic = config::Config::load().ok().and_then(|c| c.mic);
+            if let Err(e) = record_wav(secs, out, mic.as_deref()) {
                 eprintln!("record failed: {e:#}");
                 std::process::exit(1);
             }

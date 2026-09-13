@@ -87,8 +87,17 @@ Clicking the pill also toggles recording. When the pill has focus:
 ## Configuration
 
 `dictationapp --settings` opens a GUI that edits the config and hot-reloads
-the running app — you never have to touch the file. It lives at
-`~/.config/dictationapp/config.toml`:
+the running app — you never have to touch the file. Packaged installs also
+ship a **Dictation Settings** launcher entry, so it shows up in app
+launchers like fuzzel or the noctalia launcher. For a source install, copy
+it yourself:
+
+```bash
+install -Dm644 packaging/dictationapp-settings.desktop \
+  ~/.local/share/applications/
+```
+
+The config lives at `~/.config/dictationapp/config.toml`:
 
 ```toml
 api_key = "sk-or-..."            # or set OPENROUTER_API_KEY (env wins)
@@ -96,6 +105,8 @@ model = "fish-audio/transcribe-1"
 language = "en"                  # optional; omit to auto-detect
 mode = "hold"                    # "hold" or "toggle"
 hotkey = "KEY_RIGHTCTRL"         # any evdev key name, e.g. KEY_CAPSLOCK
+# mic = "USB Microphone"         # input device name (exact or substring);
+                                 # unset = system default. Pick it in Settings.
 type_text = true                 # false = clipboard only
 beeps = true                     # start/stop/error cues
 cleanup = true                   # LLM pass that tidies the transcript

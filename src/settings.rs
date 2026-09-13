@@ -1,5 +1,6 @@
 //! Settings window — a second gpui window so config.toml never needs editing.
 
+use crate::audio;
 use crate::config::Config;
 use crate::hotkey;
 use crate::ipc::Command;
@@ -41,6 +42,8 @@ pub struct SettingsView {
     language: String,
     mode_hold: bool,
     hotkey: String,
+    mic: Option<String>,
+    mic_devices: Vec<String>,
     type_text: bool,
     beeps: bool,
     cleanup: bool,
@@ -87,6 +90,7 @@ impl SettingsView {
             language: None,
             mode: "hold".into(),
             hotkey: crate::config::DEFAULT_HOTKEY.into(),
+            mic: None,
             type_text: true,
             beeps: true,
             cleanup: true,
@@ -101,6 +105,8 @@ impl SettingsView {
             language: cfg.language.unwrap_or_default(),
             mode_hold: cfg.mode != "toggle",
             hotkey: cfg.hotkey,
+            mic: cfg.mic,
+            mic_devices: audio::input_device_names(),
             type_text: cfg.type_text,
             beeps: cfg.beeps,
             cleanup: cfg.cleanup,
@@ -218,6 +224,16 @@ impl SettingsView {
         }
     }
 
+    fn pick_mic(
+        m: Option<String>,
+    ) -> impl Fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>) + 'static {
+        move |view, _, _, cx| {
+            view.mic = m.clone();
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
     fn set_mode(
         hold: bool,
     ) -> impl Fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>) + 'static {
@@ -270,6 +286,7 @@ impl SettingsView {
                 "toggle".into()
             },
             hotkey: self.hotkey.trim().to_string(),
+            mic: self.mic.clone(),
             type_text: self.type_text,
             beeps: self.beeps,
             cleanup: self.cleanup,
@@ -311,6 +328,16 @@ const RED: u32 = 0xef4444;
 
 fn section_label(text: &'static str) -> gpui::Div {
     div().text_xs().text_color(rgb(DIM)).mb_1().child(text)
+}
+
+/// Device names can be long — cap chip labels so they don't overflow.
+fn truncate_label(s: &str) -> String {
+    const MAX: usize = 40;
+    if s.chars().count() > MAX {
+        format!("{}…", s.chars().take(MAX - 1).collect::<String>())
+    } else {
+        s.to_string()
+    }
 }
 
 impl SettingsView {
@@ -377,13 +404,14 @@ impl SettingsView {
 
     fn chip(
         &self,
-        label: &'static str,
+        id: &str,
+        label: &str,
         selected: bool,
         handler: impl Fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         div()
-            .id(SharedString::from(format!("chip-{label}")))
+            .id(SharedString::from(format!("chip-{id}")))
             .px_2p5()
             .h(px(24.0))
             .flex()
@@ -401,7 +429,7 @@ impl SettingsView {
             .text_color(if selected { rgb(ACCENT) } else { rgb(DIM) })
             .hover(|s| s.border_color(rgb(ACCENT)))
             .on_mouse_down(MouseButton::Left, cx.listener(handler))
-            .child(label)
+            .child(SharedString::from(label.to_string()))
     }
 
     fn toggle(
@@ -446,16 +474,21 @@ impl SettingsView {
     }
 }
 
-impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl SettingsView {
+    /// Scrollable body — everything above the pinned footer.
+    fn scroll_content(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        // Keep a configured-but-currently-unplugged device selectable.
+        let mut mic_names = self.mic_devices.clone();
+        if let Some(m) = &self.mic {
+            if !mic_names.contains(m) {
+                mic_names.push(m.clone());
+            }
+        }
         div()
-            .key_context("Settings")
-            .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(Self::key_down))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::unfocus))
-            .size_full()
-            .bg(rgb(BG))
-            .text_color(rgb(TEXT))
+            .id("settings-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .p_4()
@@ -478,9 +511,9 @@ impl Render for SettingsView {
                     .child(self.text_field(Field::Model, "provider/model", false, cx))
                     .child(
                         div().flex().flex_row().flex_wrap().gap_1p5().children(
-                            MODEL_PRESETS
-                                .iter()
-                                .map(|m| self.chip(m, self.model == *m, Self::pick_model(m), cx)),
+                            MODEL_PRESETS.iter().map(|m| {
+                                self.chip(m, m, self.model == *m, Self::pick_model(m), cx)
+                            }),
                         ),
                     )
                     .child(
@@ -503,12 +536,19 @@ impl Render for SettingsView {
                             .flex_row()
                             .gap_1p5()
                             .child(self.chip(
+                                "hold",
                                 "Hold to talk",
                                 self.mode_hold,
                                 Self::set_mode(true),
                                 cx,
                             ))
-                            .child(self.chip("Toggle", !self.mode_hold, Self::set_mode(false), cx)),
+                            .child(self.chip(
+                                "toggle",
+                                "Toggle",
+                                !self.mode_hold,
+                                Self::set_mode(false),
+                                cx,
+                            )),
                     )
                     .child(
                         div()
@@ -519,11 +559,49 @@ impl Render for SettingsView {
                     .child(self.text_field(Field::Hotkey, "KEY_RIGHTCTRL", false, cx))
                     .child(
                         div().flex().flex_row().flex_wrap().gap_1p5().children(
-                            HOTKEY_PRESETS
-                                .iter()
-                                .map(|k| self.chip(k, self.hotkey == *k, Self::pick_hotkey(k), cx)),
+                            HOTKEY_PRESETS.iter().map(|k| {
+                                self.chip(k, k, self.hotkey == *k, Self::pick_hotkey(k), cx)
+                            }),
                         ),
                     ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .child(section_label("MICROPHONE"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap_1p5()
+                            .child(self.chip(
+                                "default",
+                                "System default",
+                                self.mic.is_none(),
+                                Self::pick_mic(None),
+                                cx,
+                            ))
+                            .children(mic_names.iter().map(|name| {
+                                self.chip(
+                                    name,
+                                    &truncate_label(name),
+                                    self.mic.as_deref() == Some(name.as_str()),
+                                    Self::pick_mic(Some(name.clone())),
+                                    cx,
+                                )
+                            })),
+                    )
+                    .when(self.mic_devices.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(DIM))
+                                .child("No input devices detected."),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -552,63 +630,86 @@ impl Render for SettingsView {
                         cx,
                     )),
             )
-            .child(div().flex_1())
+    }
+
+    /// Pinned footer — status message plus Close/Save, always visible.
+    fn footer(&self, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px_4()
+            .pb_4()
+            .pt_3()
+            .border_t_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(match &self.message {
+                        Some((_, true)) => RED,
+                        Some((_, false)) => GREEN,
+                        None => DIM,
+                    }))
+                    .child(SharedString::from(match &self.message {
+                        Some((m, _)) => m.clone(),
+                        None => "Ctrl+V to paste into fields.".to_string(),
+                    })),
+            )
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .items_center()
-                    .justify_between()
+                    .gap_2()
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(rgb(match &self.message {
-                                Some((_, true)) => RED,
-                                Some((_, false)) => GREEN,
-                                None => DIM,
-                            }))
-                            .child(SharedString::from(match &self.message {
-                                Some((m, _)) => m.clone(),
-                                None => "Ctrl+V to paste into fields.".to_string(),
-                            })),
+                            .id("close")
+                            .px_4()
+                            .h(px(32.0))
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .text_sm()
+                            .text_color(rgb(DIM))
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(rgb(TEXT)))
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::close))
+                            .child("Close"),
                     )
                     .child(
                         div()
+                            .id("save")
+                            .px_4()
+                            .h(px(32.0))
                             .flex()
-                            .flex_row()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id("close")
-                                    .px_4()
-                                    .h(px(32.0))
-                                    .flex()
-                                    .items_center()
-                                    .rounded_md()
-                                    .text_sm()
-                                    .text_color(rgb(DIM))
-                                    .cursor_pointer()
-                                    .hover(|s| s.text_color(rgb(TEXT)))
-                                    .on_mouse_down(MouseButton::Left, cx.listener(Self::close))
-                                    .child("Close"),
-                            )
-                            .child(
-                                div()
-                                    .id("save")
-                                    .px_4()
-                                    .h(px(32.0))
-                                    .flex()
-                                    .items_center()
-                                    .rounded_md()
-                                    .text_sm()
-                                    .bg(rgb(ACCENT))
-                                    .text_color(rgb(0xffffff))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(0x7d9bff)))
-                                    .on_mouse_down(MouseButton::Left, cx.listener(Self::save))
-                                    .child("Save"),
-                            ),
+                            .items_center()
+                            .rounded_md()
+                            .text_sm()
+                            .bg(rgb(ACCENT))
+                            .text_color(rgb(0xffffff))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x7d9bff)))
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::save))
+                            .child("Save"),
                     ),
             )
+    }
+}
+
+impl Render for SettingsView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .key_context("Settings")
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::key_down))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::unfocus))
+            .size_full()
+            .bg(rgb(BG))
+            .text_color(rgb(TEXT))
+            .flex()
+            .flex_col()
+            .child(self.scroll_content(cx))
+            .child(self.footer(cx))
     }
 }

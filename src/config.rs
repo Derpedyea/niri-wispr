@@ -15,6 +15,8 @@ struct FileConfig {
     mode: Option<String>,
     /// evdev key name, e.g. "KEY_RIGHTCTRL"
     hotkey: Option<String>,
+    /// input device name to record from; unset = system default
+    mic: Option<String>,
     /// type the transcript into the focused window via uinput
     type_text: Option<bool>,
     /// play subtle start/stop audio cues
@@ -30,6 +32,7 @@ pub struct Config {
     pub language: Option<String>,
     pub mode: String,
     pub hotkey: String,
+    pub mic: Option<String>,
     pub type_text: bool,
     pub beeps: bool,
     pub cleanup: bool,
@@ -83,6 +86,9 @@ impl Config {
         s.push_str(&format!("cleanup_model = {:?}\n", self.cleanup_model));
         s.push_str(&format!("mode = {:?}\n", self.mode));
         s.push_str(&format!("hotkey = {:?}\n", self.hotkey));
+        if let Some(m) = &self.mic {
+            s.push_str(&format!("mic = {m:?}\n"));
+        }
         s.push_str(&format!("type_text = {}\n", self.type_text));
         s.push_str(&format!("beeps = {}\n", self.beeps));
         if let Some(parent) = self.path.parent() {
@@ -109,6 +115,7 @@ fn from_file(path: PathBuf, file: FileConfig, env_api_key: Option<String>) -> Co
             .hotkey
             .filter(|h| !h.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_HOTKEY.to_string()),
+        mic: file.mic.filter(|m| !m.trim().is_empty()),
         type_text: file.type_text.unwrap_or(true),
         beeps: file.beeps.unwrap_or(true),
         cleanup: file.cleanup.unwrap_or(true),
@@ -141,5 +148,29 @@ mod tests {
         let cfg = from_file(PathBuf::from("/tmp/x"), file, None);
         assert!(!cfg.cleanup);
         assert_eq!(cfg.cleanup_model, "custom/model");
+    }
+
+    #[test]
+    fn mic_defaults_to_none_and_blank_is_ignored() {
+        assert!(
+            from_file(PathBuf::from("/tmp/x"), FileConfig::default(), None)
+                .mic
+                .is_none()
+        );
+        let file = FileConfig {
+            mic: Some("   ".into()),
+            ..Default::default()
+        };
+        assert!(from_file(PathBuf::from("/tmp/x"), file, None).mic.is_none());
+        let file = FileConfig {
+            mic: Some("USB Mic".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            from_file(PathBuf::from("/tmp/x"), file, None)
+                .mic
+                .as_deref(),
+            Some("USB Mic")
+        );
     }
 }

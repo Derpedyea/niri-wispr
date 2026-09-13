@@ -55,7 +55,8 @@ jobs:
           mkdir -p dist
           tar -czf "dist/dictationapp-${GITHUB_REF_NAME}-x86_64-linux-gnu.tar.gz" \
             -C target/release dictationapp \
-            -C "$GITHUB_WORKSPACE" LICENSE README.md
+            -C "$GITHUB_WORKSPACE" LICENSE README.md \
+            packaging/dictationapp-settings.desktop
           (cd dist && sha256sum *.tar.gz > sha256sums.txt)
 
       - name: Create GitHub release

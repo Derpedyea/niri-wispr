@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Dictation Settings
+Comment=Configure dictationapp — hotkey, models, cleanup
+Exec=dictationapp --settings
+Icon=audio-input-microphone
+Categories=Settings;
+Keywords=dictation;speech;voice;transcription;
+StartupNotify=false

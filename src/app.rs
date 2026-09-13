@@ -199,7 +199,7 @@ impl DictationView {
             self.show_error("Add an OpenRouter API key in Settings.");
             return;
         }
-        match audio::start() {
+        match audio::start(self.config.mic.as_deref()) {
             Ok(rec) => {
                 eprintln!("recording started ({} Hz)", rec.sample_rate);
                 if self.config.beeps {
@@ -217,7 +217,11 @@ impl DictationView {
                 if self.config.beeps {
                     beep::error();
                 }
-                self.show_error("Microphone unavailable. Check your input device.");
+                self.show_error(if self.config.mic.is_some() {
+                    "Microphone unavailable — check Settings → Microphone."
+                } else {
+                    "Microphone unavailable. Check your input device."
+                });
             }
         }
     }

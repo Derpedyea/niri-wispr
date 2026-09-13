@@ -123,6 +123,9 @@ impl Typer {
             KeyCode::KEY_RIGHTALT,
             KeyCode::KEY_BACKSPACE,
             KeyCode::KEY_ESC,
+            // Never emitted when typing — lets hotkey tests use a key no real
+            // config binds, so a running instance doesn't react to test events.
+            KeyCode::KEY_F24,
         ] {
             keys.insert(k);
         }

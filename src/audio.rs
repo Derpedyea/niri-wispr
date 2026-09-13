@@ -75,12 +75,73 @@ where
     Ok(stream)
 }
 
-/// Start capturing from the default input device.
-pub fn start() -> Result<Recording> {
+fn device_name(device: &Device) -> Option<String> {
+    device
+        .description()
+        .ok()
+        .map(|d| d.name().to_string())
+        .filter(|n| !n.trim().is_empty())
+}
+
+/// Names of input devices that can actually stream, for the settings picker.
+pub fn input_device_names() -> Vec<String> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("no default input device found"))?;
+    let Ok(devices) = host.input_devices() else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+    for d in devices {
+        if d.default_input_config().is_err() {
+            continue;
+        }
+        if let Some(name) = device_name(&d) {
+            if seen.insert(name.clone()) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+/// Pick the input device for `mic` (None/blank = system default). A configured
+/// name matches exactly, else case-insensitive substring.
+fn pick_input_device(mic: Option<&str>) -> Result<Device> {
+    let host = cpal::default_host();
+    let Some(want) = mic.map(str::trim).filter(|m| !m.is_empty()) else {
+        return host
+            .default_input_device()
+            .ok_or_else(|| anyhow!("no default input device found"));
+    };
+    let mut partial = None;
+    let mut available = Vec::new();
+    let devices = host
+        .input_devices()
+        .context("failed to list input devices")?;
+    for d in devices {
+        let Some(name) = device_name(&d) else {
+            continue;
+        };
+        if name == want {
+            return Ok(d);
+        }
+        if partial.is_none() && name.to_lowercase().contains(&want.to_lowercase()) {
+            partial = Some(d);
+        }
+        available.push(name);
+    }
+    partial.ok_or_else(|| {
+        anyhow!(
+            "microphone {want:?} not found (available: {})",
+            available.join(", ")
+        )
+    })
+}
+
+/// Start capturing from the configured input device (`mic` = device name,
+/// None/blank = system default).
+pub fn start(mic: Option<&str>) -> Result<Recording> {
+    let device = pick_input_device(mic)?;
     let supported = device
         .default_input_config()
         .context("failed to get default input config")?;
@@ -88,10 +149,7 @@ pub fn start() -> Result<Recording> {
     let sample_rate = config.sample_rate;
     eprintln!(
         "audio input: {} ({} ch, {} Hz, {})",
-        device
-            .description()
-            .map(|d| d.name().to_string())
-            .unwrap_or_else(|_| "?".into()),
+        device_name(&device).unwrap_or_else(|| "?".into()),
         config.channels,
         sample_rate,
         supported.sample_format(),
@@ -126,6 +184,22 @@ pub fn start() -> Result<Recording> {
         capture,
         sample_rate,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[ignore] // needs real audio hardware — run with --ignored
+    fn lists_and_opens_input_devices() {
+        let names = super::input_device_names();
+        for n in &names {
+            eprintln!("input device: {n}");
+        }
+        assert!(!names.is_empty(), "no input devices on this system");
+        for n in &names {
+            assert!(super::start(Some(n)).is_ok(), "failed to open device {n:?}");
+        }
+    }
 }
 
 /// Encode mono f32 samples as 16-bit PCM WAV bytes.

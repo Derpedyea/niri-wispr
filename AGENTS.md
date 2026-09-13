@@ -22,7 +22,9 @@ repo, fill pkgver/sha256, `makepkg --printsrcinfo` as unprivileged `builder`,
 push to master). Skipped unless `AUR_SSH_PRIVATE_KEY` secret is set; optional
 `AUR_USERNAME`/`AUR_EMAIL` set the AUR commit identity. PKGBUILD templates live
 in `packaging/aur/` (MIT licensed — LICENSE ships in both packages and in the
-release tarball).
+release tarball). `packaging/dictationapp-settings.desktop` ships in the tarball
+and both packages install it — it's how the settings window surfaces in app
+launchers (Exec runs `dictationapp --settings`, i.e. IPC to the running instance).
 
 Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, errors).
 
@@ -33,7 +35,9 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
 - `app.rs` — GPUI pill UI + command pump (`cx.spawn` + `timer` poll of `mpsc::Receiver`),
   state machine Idle → Recording → Transcribing → Cleaning → Typing. Idle renders fully
   transparent; active recording shows a 21-sample waveform from measured input levels.
-- `audio.rs` — cpal capture to mono f32 + hound WAV encode.
+- `audio.rs` — cpal capture to mono f32 + hound WAV encode. `mic` config selects the input
+  device by name (exact, else case-insensitive substring; unset = system default).
+  `input_device_names()` lists streamable devices for the settings picker.
 - `api.rs` — OpenRouter transcription (`POST /api/v1/audio/transcriptions`) followed optionally
   by conservative text cleanup (`POST /api/v1/chat/completions`); cleanup failure falls back to
   the raw transcript.
@@ -83,5 +87,6 @@ toggles caused invisible recordings). Re-add a `spawn ".../dictationapp" "--togg
 - The pill opens without focus so typed text lands in the previously focused app. Closing the
   settings window can focus the idle toplevel; refocus the destination app before dictating.
 - `type_text = false` in config → clipboard-only mode.
-- New input devices plugged in after startup aren't watched (enumeration is one-shot);
-  restart the app if you hot-plug a keyboard.
+- The hotkey watcher rescans /dev/input every second, so hot-plugged or
+  suspend/resume-recreated keyboards are picked up within ~1s; devices that fail
+  to open (e.g. ACL not yet applied) are retried each scan.
