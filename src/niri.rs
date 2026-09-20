@@ -12,8 +12,18 @@ const PILL_H: f64 = 64.0;
 const BOTTOM_GAP: f64 = 80.0;
 
 /// If niri is the running compositor, move our window to the bottom-center
-/// of whatever output it opened on. Safe no-op elsewhere.
+/// of the focused output. Safe no-op elsewhere.
 pub fn place_at_bottom() {
+    // Give niri a moment to map the window.
+    spawn_place(Duration::from_millis(400));
+}
+
+/// Follow the focused output when a recording reuses an already visible pill.
+pub fn reposition() {
+    spawn_place(Duration::from_millis(50));
+}
+
+fn spawn_place(delay: Duration) {
     if Command::new("niri")
         .args(["msg", "--version"])
         .output()
@@ -21,9 +31,8 @@ pub fn place_at_bottom() {
     {
         return;
     }
-    std::thread::spawn(|| {
-        // Give niri a moment to map the window.
-        std::thread::sleep(Duration::from_millis(400));
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
         if let Err(e) = place() {
             eprintln!("niri: could not position pill: {e:#}");
         }
@@ -35,20 +44,56 @@ fn place() -> Result<()> {
     let win = windows
         .as_array()
         .and_then(|w| {
-            w.iter()
-                .find(|w| w["app_id"].as_str() == Some("dictationapp"))
+            w.iter().find(|w| {
+                w["app_id"].as_str() == Some("dictationapp")
+                    && w["title"].as_str() == Some("Dictation")
+            })
         })
         .context("dictationapp window not found")?;
     let wid = win["id"].as_u64().context("no window id")?;
     let ws_id = win["workspace_id"].as_u64().context("no workspace id")?;
 
-    // Which output is this window's workspace on?
+    // The pill belongs on the focused workspace — the output the user is
+    // looking at. Fall back to its current workspace if none is focused.
     let workspaces = msg_json(&["workspaces"])?;
-    let output_name = workspaces
-        .as_array()
-        .and_then(|w| w.iter().find(|w| w["id"].as_u64() == Some(ws_id)))
-        .and_then(|w| w["output"].as_str().map(str::to_owned))
+    let ws_list = workspaces.as_array().context("bad workspaces json")?;
+    let own_ws = ws_list.iter().find(|w| w["id"].as_u64() == Some(ws_id));
+    let target = ws_list
+        .iter()
+        .find(|w| w["is_focused"].as_bool() == Some(true))
+        .or(own_ws)
         .context("workspace not found")?;
+    let target_ws = target["id"].as_u64().context("no workspace id")?;
+    let target_idx = target["idx"].as_u64().context("no workspace index")?;
+    let output_name = target["output"]
+        .as_str()
+        .context("workspace has no output")?
+        .to_owned();
+    let own_output = own_ws.and_then(|w| w["output"].as_str()).unwrap_or("");
+
+    if target_ws != ws_id {
+        if own_output != output_name {
+            // Cross-output: lands on that output's active workspace, which is
+            // the focused one.
+            run_action(&[
+                "move-window-to-monitor",
+                "--id",
+                &wid.to_string(),
+                &output_name,
+            ])?;
+        } else {
+            // Same output, inactive workspace: the index resolves on the
+            // window's own output — the focused one here.
+            run_action(&[
+                "move-window-to-workspace",
+                "--window-id",
+                &wid.to_string(),
+                "--focus",
+                "false",
+                &target_idx.to_string(),
+            ])?;
+        }
+    }
 
     // That output's logical size.
     let outputs = msg_json(&["outputs"])?;
@@ -63,22 +108,30 @@ fn place() -> Result<()> {
     let x = ((w - PILL_W) / 2.0).round() as i64;
     let y = (h - PILL_H - BOTTOM_GAP).round() as i64;
 
+    run_action(&[
+        "move-floating-window",
+        "--id",
+        &wid.to_string(),
+        "-x",
+        &x.to_string(),
+        "-y",
+        &y.to_string(),
+    ])
+}
+
+fn run_action(args: &[&str]) -> Result<()> {
+    let mut full = vec!["msg", "action"];
+    full.extend_from_slice(args);
     let out = Command::new("niri")
-        .args([
-            "msg",
-            "action",
-            "move-floating-window",
-            "--id",
-            &wid.to_string(),
-            "-x",
-            &x.to_string(),
-            "-y",
-            &y.to_string(),
-        ])
+        .args(&full)
         .output()
-        .context("move-floating-window failed")?;
+        .context("niri msg action failed")?;
     if !out.status.success() {
-        anyhow::bail!("niri msg: {}", String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "niri {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(())
 }

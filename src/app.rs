@@ -3,10 +3,11 @@ use crate::config::Config;
 use crate::hotkey::Watcher;
 use crate::ipc::Command;
 use crate::typer::Typer;
-use crate::{api, audio, beep, settings};
+use crate::{api, audio, beep, niri, settings};
 use gpui::{
-    App, ClipboardItem, Context, FocusHandle, Focusable, MouseButton, MouseDownEvent, SharedString,
-    Window, div, prelude::*, px, rgb, rgba,
+    App, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, MouseButton,
+    MouseDownEvent, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowHandle, WindowOptions, div, prelude::*, px, rgb, rgba, size,
 };
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -47,6 +48,7 @@ fn push_waveform(history: &mut [f32; BAR_COUNT], smoothed: &mut f32, level: f32)
 
 pub struct DictationView {
     focus_handle: FocusHandle,
+    window: Option<WindowHandle<Self>>,
     config: Config,
     status: Status,
     recording: Option<Recording>,
@@ -74,6 +76,7 @@ impl DictationView {
     ) -> Self {
         let view = Self {
             focus_handle: cx.focus_handle(),
+            window: None,
             config,
             status: Status::Idle,
             recording: None,
@@ -130,6 +133,12 @@ impl DictationView {
                 };
                 if !alive {
                     break;
+                }
+                // Opening a window renders its root, so release the view update first.
+                if let Some(view) = this.upgrade()
+                    && let Err(error) = cx.update(|cx| Self::sync_window(&view, cx)).flatten()
+                {
+                    eprintln!("pill window: {error:#}");
                 }
             }
         })
@@ -211,6 +220,10 @@ impl DictationView {
                 };
                 self.reset_waveform();
                 self.clear_message();
+                // A recent notice can keep the previous pill open between recordings.
+                if self.window.is_some() {
+                    niri::reposition();
+                }
             }
             Err(e) => {
                 eprintln!("audio start failed: {e:#}");
@@ -427,6 +440,48 @@ impl DictationView {
 
     fn pill_visible(&self) -> bool {
         self.status.is_active() || self.error.is_some() || self.notice.is_some()
+    }
+
+    /// An invisible toplevel still captures focus on niri, even with an empty
+    /// Wayland input region. Only keep a real window while there is a visible pill.
+    fn sync_window(view: &Entity<Self>, cx: &mut App) -> anyhow::Result<()> {
+        if view.read(cx).pill_visible() && view.read(cx).window.is_none() {
+            let root = view.clone();
+            let pill = size(px(300.0), px(64.0));
+            let bounds = Bounds::centered(None, pill, cx);
+            let window = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Dictation".into()),
+                        appears_transparent: true,
+                        traffic_light_position: None,
+                    }),
+                    window_background: WindowBackgroundAppearance::Transparent,
+                    app_id: Some("dictationapp".to_owned()),
+                    focus: false,
+                    is_resizable: false,
+                    window_min_size: Some(pill),
+                    ..Default::default()
+                },
+                move |window, cx| {
+                    window.set_window_title("Dictation");
+                    window.resize(pill);
+                    window.on_window_should_close(cx, |_, cx| {
+                        cx.quit();
+                        true
+                    });
+                    root
+                },
+            )?;
+            view.update(cx, |view, _| view.window = Some(window));
+            niri::place_at_bottom();
+        } else if !view.read(cx).pill_visible()
+            && let Some(window) = view.update(cx, |view, _| view.window.take())
+        {
+            cx.update_window(window.into(), |_, window, _| window.remove_window())?;
+        }
+        Ok(())
     }
 
     fn status_label(&self) -> String {

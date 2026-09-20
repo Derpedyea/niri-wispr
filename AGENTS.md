@@ -31,10 +31,13 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
 ## Architecture
 
 - `main.rs` — CLI dispatch (`--toggle/--start/--stop/--cancel/--quit`), GPUI app bootstrap,
-  wires channel → IPC listener + evdev hotkey + uinput typer → transparent pill window.
+  wires channel → IPC listener + evdev hotkey + uinput typer; retains the view in an
+  app global so the service stays alive without any windows.
 - `app.rs` — GPUI pill UI + command pump (`cx.spawn` + `timer` poll of `mpsc::Receiver`),
-  state machine Idle → Recording → Transcribing → Cleaning → Typing. Idle renders fully
-  transparent; active recording shows a 21-sample waveform from measured input levels.
+  state machine Idle → Recording → Transcribing → Cleaning → Typing. Creates the pill
+  only while active or showing a message, and removes the native window when idle.
+  Active recording shows a 21-sample waveform from measured input levels. Window creation
+  runs outside the view update because opening a GPUI window renders its root immediately.
 - `audio.rs` — cpal capture to mono f32 + hound WAV encode. `mic` config selects the input
   device by name (exact, else case-insensitive substring; unset = system default).
   `input_device_names()` lists streamable devices for the settings picker.
@@ -47,8 +50,13 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
 - `typer.rs` — evdev uinput virtual keyboard; types text into whatever window is focused.
 - `beep.rs` — start/stop/error audio cues; WAVs generated once into `dirs::cache_dir()/dictationapp`,
   played via pw-play/paplay/aplay. `beeps = false` in config disables.
-- `niri.rs` — moves the pill to bottom-center of its output via `niri msg`
+- `niri.rs` — moves the pill to bottom-center of the **focused** output via `niri msg`
   (niri 26.04's `default-floating-position` doesn't honor edge anchors here — verified visually).
+  Places each newly opened pill and repositions when recording reuses a visible one,
+  so it follows the monitor the user is looking at:
+  cross-output via `move-window-to-monitor` (lands on the focused workspace), same-output
+  via `move-window-to-workspace` (index resolves on the window's own output). Note:
+  `move-floating-window` y is relative to the work area below any top-bar strut.
 - `settings.rs` — second gpui window (`dictationapp --settings`) with fields for API key,
   speech model, language, hotkey, mode, output, sound, and transcript cleanup. Save writes
   config.toml and sends `Command::Reload` — the pill hot-reloads.
@@ -63,8 +71,8 @@ by **title** (`window.set_window_title` is required — `titlebar.title` alone n
 the toplevel on Wayland):
 - `title="^Dictation$"` (the pill): `open-floating true`, `open-focused false`,
   `min/max-width 320`, `min/max-height 64`, plus `blur false` and disabled focus ring/border.
-  The effect overrides the global blur rule: otherwise niri renders a noisy rectangle behind the
-  fully transparent idle toplevel. Min/max pinning is required because niri does not honor the
+  The effect overrides the global blur rule around the visible pill's transparent margins.
+  Min/max pinning is required because niri does not honor the
   client's requested size for floating windows.
 - `title="Dictation Settings"`: `open-floating true`, `min/max 460x760` (floats open centered).
 
@@ -82,10 +90,13 @@ toggles caused invisible recordings). Re-add a `spawn ".../dictationapp" "--togg
   recording). Toggle mode could double-fire — set `hotkey` to a key unique to one device.
 - `/dev/input/event*` needs read access (user ACL); `/dev/uinput` needs write access.
   Without them: IPC + pill-click still work; typing degrades to clipboard-only.
-- The idle pill remains a mapped 320x64 Wayland toplevel but renders alpha-zero; keep its niri
-  blur/focus-ring/border overrides or compositor effects reveal the invisible surface.
-- The pill opens without focus so typed text lands in the previously focused app. Closing the
-  settings window can focus the idle toplevel; refocus the destination app before dictating.
+- Never leave an alpha-zero idle toplevel mapped: it blocks underlying buttons and steals
+  focus on niri, even with an empty Wayland input region. Idle must mean no pill window.
+- GPUI 0.2.2 normally exits when its last Linux window closes. `vendor/gpui` adds an opt-out;
+  `main.rs` disables automatic exit and keeps the model alive independently of windows.
+  Preserve explicit `--quit` and manual pill-close behavior. See `vendor/gpui/PATCHES.md`
+  and `docs/window-lifecycle.md` before updating GPUI or changing window lifetime.
+- The pill opens without focus so typed text lands in the previously focused app.
 - `type_text = false` in config → clipboard-only mode.
 - The hotkey watcher rescans /dev/input every second, so hot-plugged or
   suspend/resume-recreated keyboards are picked up within ~1s; devices that fail

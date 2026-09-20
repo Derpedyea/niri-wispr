@@ -10,14 +10,17 @@ mod settings;
 mod typer;
 
 use app::DictationView;
-use gpui::{
-    App, AppContext, Application, Bounds, KeyBinding, TitlebarOptions, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions, actions, px, size,
-};
+use gpui::{App, AppContext, Application, Entity, Global, KeyBinding, actions};
 use ipc::Command;
 use std::sync::mpsc::channel;
 
 actions!(dictation, [Toggle, Cancel, Quit]);
+
+// Keep the command/audio state alive while no pill or settings window is open.
+struct DictationApp {
+    _view: Entity<DictationView>,
+}
+impl Global for DictationApp {}
 
 fn usage() -> ! {
     eprintln!(
@@ -152,33 +155,8 @@ fn main() {
             KeyBinding::new("ctrl-q", Quit, None),
         ]);
 
-        let pill = size(px(300.0), px(64.0));
-        let bounds = Bounds::centered(None, pill, cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Dictation".into()),
-                    appears_transparent: true,
-                    traffic_light_position: None,
-                }),
-                window_background: WindowBackgroundAppearance::Transparent,
-                app_id: Some("dictationapp".to_string()),
-                focus: false,
-                is_resizable: false,
-                window_min_size: Some(pill),
-                ..Default::default()
-            },
-            move |window, cx| {
-                let view =
-                    cx.new(|cx| DictationView::new(config.clone(), rx, tx2, typer, watcher, cx));
-                window.set_window_title("Dictation");
-                window.resize(pill);
-                view
-            },
-        )
-        .unwrap();
-        niri::place_at_bottom();
-        cx.activate(true);
+        cx.set_quit_on_last_window_close(false);
+        let view = cx.new(|cx| DictationView::new(config.clone(), rx, tx2, typer, watcher, cx));
+        cx.set_global(DictationApp { _view: view });
     });
 }

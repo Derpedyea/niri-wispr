@@ -1,0 +1,101 @@
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -1,3 +1,4 @@
++// Modified for Dictation: optional Linux background lifetime (see PATCHES.md).
+ use std::{
+     any::{TypeId, type_name},
+     cell::{BorrowMutError, Ref, RefCell, RefMut},
+@@ -750,6 +751,12 @@
+         self.platform.quit();
+     }
+ 
++    /// Controls whether closing the last Linux window ends the application.
++    /// Background apps can opt out while retaining explicit `quit()` behavior.
++    pub fn set_quit_on_last_window_close(&self, quit: bool) {
++        self.platform.set_quit_on_last_window_close(quit);
++    }
++
+     /// Schedules all windows in the application to be redrawn. This can be called
+     /// multiple times in an update cycle and still result in a single redraw.
+     pub fn refresh_windows(&mut self) {
+--- a/src/platform.rs
++++ b/src/platform.rs
+@@ -1,3 +1,4 @@
++// Modified for Dictation: optional Linux background lifetime (see PATCHES.md).
+ mod app_menu;
+ mod keyboard;
+ mod keystroke;
+@@ -167,6 +168,7 @@
+ 
+     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>);
+     fn quit(&self);
++    fn set_quit_on_last_window_close(&self, _quit: bool) {}
+     fn restart(&self, binary_path: Option<PathBuf>);
+     fn activate(&self, ignoring_other_apps: bool);
+     fn hide(&self);
+--- a/src/platform/linux/platform.rs
++++ b/src/platform/linux/platform.rs
+@@ -1,3 +1,4 @@
++// Modified for Dictation: optional Linux background lifetime (see PATCHES.md).
+ use std::{
+     env,
+     path::{Path, PathBuf},
+@@ -101,6 +102,7 @@
+     pub(crate) auto_hide_scrollbars: bool,
+     pub(crate) callbacks: PlatformHandlers,
+     pub(crate) signal: LoopSignal,
++    pub(crate) quit_on_last_window_close: bool,
+     pub(crate) menus: Vec<OwnedMenu>,
+ }
+ 
+@@ -127,6 +129,7 @@
+             auto_hide_scrollbars: false,
+             callbacks,
+             signal,
++            quit_on_last_window_close: true,
+             menus: Vec::new(),
+         };
+ 
+@@ -168,6 +171,10 @@
+         if let Some(mut fun) = quit {
+             fun();
+         }
++    }
++
++    fn set_quit_on_last_window_close(&self, quit: bool) {
++        self.with_common(|common| common.quit_on_last_window_close = quit);
+     }
+ 
+     fn quit(&self) {
+--- a/src/platform/linux/wayland/client.rs
++++ b/src/platform/linux/wayland/client.rs
+@@ -1,3 +1,4 @@
++// Modified for Dictation: optional Linux background lifetime (see PATCHES.md).
+ use std::{
+     cell::{RefCell, RefMut},
+     hash::Hash,
+@@ -384,7 +385,7 @@
+         {
+             state.keyboard_focused_window = Some(window);
+         }
+-        if state.windows.is_empty() {
++        if state.windows.is_empty() && state.common.quit_on_last_window_close {
+             state.common.signal.stop();
+         }
+     }
+--- a/src/platform/linux/x11/client.rs
++++ b/src/platform/linux/x11/client.rs
+@@ -1,3 +1,4 @@
++// Modified for Dictation: optional Linux background lifetime (see PATCHES.md).
+ use crate::{Capslock, xcb_flush};
+ use anyhow::{Context as _, anyhow};
+ use ashpd::WindowIdentifier;
+@@ -247,7 +248,7 @@
+         }
+         state.cursor_styles.remove(&x_window);
+ 
+-        if state.windows.is_empty() {
++        if state.windows.is_empty() && state.common.quit_on_last_window_close {
+             state.common.signal.stop();
+         }
+     }

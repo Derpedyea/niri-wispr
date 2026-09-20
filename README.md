@@ -10,8 +10,8 @@ Built for [niri](https://github.com/YaLTeR/niri); powered by
 [OpenRouter](https://openrouter.ai).
 
 A small pill tracks the state — recording (with a live waveform),
-transcribing, cleaning up, typing — and fades to fully transparent when idle,
-so it costs nothing to leave running.
+transcribing, cleaning up, typing — and closes completely when idle. The
+hotkey keeps working without an invisible window intercepting clicks or focus.
 
 ## How it works
 
@@ -66,7 +66,7 @@ the `input` group plus a udev rule, or logind ACLs.
 
 ## Usage
 
-Run `dictationapp` once — it stays resident, shows the pill, and listens for
+Run `dictationapp` once — it stays resident without an idle window and listens for
 the hotkey and for commands on a Unix socket
 (`$XDG_RUNTIME_DIR/dictationapp-$USER.sock`):
 
@@ -122,7 +122,7 @@ Two window rules make the pill behave like an overlay. They're matched by
 `app-id` and title (both set in code, so rules only need to match):
 
 ```kdl
-// Pill — invisible when idle, never takes focus
+// Pill — exists only while active or showing a message; opens without focus
 window-rule {
     match app-id="dictationapp" title="^Dictation$"
     open-floating true
@@ -131,7 +131,7 @@ window-rule {
     max-width 320
     min-height 64
     max-height 64
-    // disable compositor effects that would reveal the transparent surface:
+    // Optional: disable effects around the pill's transparent margins:
     // blur off, focus ring / border off
 }
 
@@ -146,9 +146,10 @@ window-rule {
 }
 ```
 
-The min/max pinning is load-bearing: niri ignores the client's requested size
-for floating windows, and without the blur/focus-ring overrides the
-compositor paints effects behind the transparent idle window.
+The min/max pinning keeps the floating pill at its intended size. It appears
+at the bottom-center of the focused monitor/workspace each time it opens.
+When idle, there is no window to cover buttons underneath it, including
+after maximizing another app.
 
 An optional compositor-level toggle:
 
@@ -163,8 +164,8 @@ binds {
 - **Nothing types** — check `/dev/uinput` write access. Transcripts still
   reach the clipboard; `type_text = false` silences the startup warning.
 - **Hotkey does nothing** — check read access to `/dev/input/event*`. IPC
-  (`--toggle`, clicking the pill) works regardless. Devices plugged in after
-  startup aren't picked up; restart the app.
+  (`--toggle`, clicking a visible pill) works regardless. The watcher picks
+  up newly connected devices within about a second.
 - **The hotkey isn't swallowed** — there's no device grab (grabbing would
   break normal typing), so the key also reaches the focused app. Pick an
   inert key like Right Ctrl.
@@ -226,6 +227,11 @@ cargo test -- --ignored        # network test (needs OPENROUTER_API_KEY + /tmp/s
 Rust + [gpui](https://github.com/zed-industries/zed) (UI), cpal (audio),
 hound (WAV), evdev/uinput (hotkey + typing), ureq (HTTP).
 
+GPUI 0.2.2 is vendored with a small Linux lifetime patch so closing the last
+window does not shut down the background hotkey/IPC service. See
+[vendor/gpui/PATCHES.md](vendor/gpui/PATCHES.md) for provenance and the patch,
+and [docs/window-lifecycle.md](docs/window-lifecycle.md) for native verification.
+
 | File | Role |
 | --- | --- |
 | `main.rs` | CLI dispatch, GPUI bootstrap, wiring |
@@ -244,3 +250,6 @@ hound (WAV), evdev/uinput (hotkey + typing), ureq (HTTP).
 ## License
 
 [MIT](LICENSE) © Derpedyea
+
+Vendored GPUI is © Zed Industries, Inc., licensed under
+[Apache-2.0](vendor/gpui/LICENSE-APACHE).

@@ -5,7 +5,7 @@ pkgrel=1
 pkgdesc="Wispr Flow-style push-to-talk dictation for Wayland/niri"
 arch=('x86_64' 'aarch64')
 url="https://github.com/Derpedyea/niri-wispr"
-license=('MIT')
+license=('MIT' 'Apache-2.0')
 depends=(
   'glibc'
   'gcc-libs'
@@ -40,4 +40,5 @@ package() {
   install -Dm755 target/release/dictationapp "$pkgdir/usr/bin/dictationapp"
   install -Dm644 packaging/dictationapp-settings.desktop -t "$pkgdir/usr/share/applications/"
   install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+  install -Dm644 vendor/gpui/LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/GPUI-LICENSE-APACHE"
 }
