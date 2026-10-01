@@ -34,7 +34,9 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
   wires channel → IPC listener + evdev hotkey + uinput typer; retains the view in an
   app global so the service stays alive without any windows.
 - `app.rs` — GPUI pill UI + command pump (`cx.spawn` + `timer` poll of `mpsc::Receiver`),
-  state machine Idle → Recording → Transcribing → Cleaning → Typing. Creates the pill
+  state machine Idle → Recording → Transcribing → Cleaning → Typing. Capture starts on Start,
+  but the beep and pill — or a start failure (no API key, no mic) — wait `hotkey::MIN_HOLD`
+  (250ms), so taps and shortcuts the hotkey cancels before then stay invisible. Creates the pill
   only while active or showing a message, and removes the native window when idle.
   Active recording shows a 21-sample waveform from measured input levels. Window creation
   runs outside the view update because opening a GPUI window renders its root immediately.
@@ -46,7 +48,11 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
   the raw transcript.
 - `ipc.rs` — Unix socket at `$XDG_RUNTIME_DIR/dictationapp-$USER.sock`; stale socket takeover on bind.
 - `hotkey.rs` — evdev: watches every readable `/dev/input/event*` supporting the hotkey.
-  Hold mode: press→Start, release→Stop. Toggle mode: press→Toggle.
+  One hold state is shared across devices. Hold mode: press→Start, release→Stop (Cancel if
+  held under `MIN_HOLD` — timed here from key events, since the app sees commands late), any other
+  key during the hold→Cancel (it's a shortcut like RightCtrl+C); a Ctrl/Shift/Alt/Super already
+  held at press makes it a shortcut too (Ctrl+C with hotkey C). Toggle mode: release of a
+  lone tap→Toggle. No time debounce — one dropped a quick tap's release and left recordings running.
 - `typer.rs` — evdev uinput virtual keyboard; types text into whatever window is focused.
 - `beep.rs` — start/stop/error audio cues; WAVs generated once into `dirs::cache_dir()/dictationapp`,
   played via pw-play/paplay/aplay. `beeps = false` in config disables.
@@ -86,8 +92,7 @@ toggles caused invisible recordings). Re-add a `spawn ".../dictationapp" "--togg
 
 - Hotkey events pass through to the focused app too (no device grab — grabbing would block
   normal typing). RightCtrl is inert in practice.
-- If several devices report the same key, Hold mode dedupes naturally (Start is a no-op while
-  recording). Toggle mode could double-fire — set `hotkey` to a key unique to one device.
+- If several devices report the same key, overlapping holds count as one gesture.
 - `/dev/input/event*` needs read access (user ACL); `/dev/uinput` needs write access.
   Without them: IPC + pill-click still work; typing degrades to clipboard-only.
 - Never leave an alpha-zero idle toplevel mapped: it blocks underlying buttons and steals
