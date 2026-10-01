@@ -31,6 +31,10 @@ enum Input {
     HotkeyUp,
     /// Any other keyboard key pressed.
     OtherKey,
+    /// Ctrl, Shift, Alt, or Super pressed or released. Tracked so one already
+    /// held when the hotkey goes down (Ctrl+C with hotkey C) makes a shortcut.
+    ModifierDown(KeyCode),
+    ModifierUp(KeyCode),
     /// The device vanished (unplug, suspend) — a hotkey held on it will
     /// never be released.
     Lost,
@@ -40,13 +44,30 @@ fn classify(ev: &InputEvent, key: KeyCode) -> Option<Input> {
     if ev.event_type() != EventType::KEY {
         return None;
     }
+    let code = KeyCode(ev.code());
     // value: 0 = release, 1 = press, 2 = autorepeat
-    match (ev.code() == key.code(), ev.value()) {
+    match (code == key, ev.value()) {
         (true, 1) => Some(Input::HotkeyDown),
         (true, 0) => Some(Input::HotkeyUp),
-        (false, 1) if !is_button(KeyCode(ev.code())) => Some(Input::OtherKey),
+        (false, 1) if is_modifier(code) => Some(Input::ModifierDown(code)),
+        (false, 0) if is_modifier(code) => Some(Input::ModifierUp(code)),
+        (false, 1) if !is_button(code) => Some(Input::OtherKey),
         _ => None,
     }
+}
+
+fn is_modifier(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::KEY_LEFTCTRL
+            | KeyCode::KEY_RIGHTCTRL
+            | KeyCode::KEY_LEFTSHIFT
+            | KeyCode::KEY_RIGHTSHIFT
+            | KeyCode::KEY_LEFTALT
+            | KeyCode::KEY_RIGHTALT
+            | KeyCode::KEY_LEFTMETA
+            | KeyCode::KEY_RIGHTMETA
+    )
 }
 
 /// Pointer, touch, and gamepad buttons. Every other key code is a keyboard
@@ -68,8 +89,11 @@ struct Hold {
     down: HashSet<PathBuf>,
     /// When the current hold began; only meaningful while `down` is non-empty.
     since: Instant,
-    /// Another key was pressed during this hold: it's a shortcut like
-    /// RightCtrl+C, not dictation.
+    /// Modifiers currently held, per device. Only modifiers: a letter still
+    /// down from fast typing must not swallow the dictation that follows.
+    modifiers: HashSet<(PathBuf, KeyCode)>,
+    /// Another key was pressed during this hold, or a modifier was already
+    /// held when it began: it's a shortcut like RightCtrl+C, not dictation.
     chorded: bool,
 }
 
@@ -78,6 +102,7 @@ impl Hold {
         Hold {
             down: HashSet::new(),
             since: Instant::now(),
+            modifiers: HashSet::new(),
             chorded: false,
         }
     }
@@ -95,8 +120,8 @@ impl Hold {
                     return None;
                 }
                 self.since = now;
-                self.chorded = false;
-                (mode == Mode::Hold).then_some(Command::Start)
+                self.chorded = !self.modifiers.is_empty();
+                (mode == Mode::Hold && !self.chorded).then_some(Command::Start)
             }
             // A release we never saw pressed (key already down when the
             // listener attached) is ignored.
@@ -110,21 +135,33 @@ impl Hold {
                     Mode::Toggle => Command::Toggle,
                 })
             }
-            Input::OtherKey => {
-                if self.down.is_empty() || self.chorded {
-                    return None;
-                }
-                self.chorded = true;
-                (mode == Mode::Hold).then_some(Command::Cancel)
+            Input::OtherKey => self.chord(mode),
+            Input::ModifierDown(key) => {
+                self.modifiers.insert((dev.to_path_buf(), key));
+                self.chord(mode)
+            }
+            Input::ModifierUp(key) => {
+                self.modifiers.remove(&(dev.to_path_buf(), key));
+                None
             }
             // Nothing will release this hold, so discard rather than transcribe.
             Input::Lost => {
+                self.modifiers.retain(|(held_on, _)| held_on != dev);
                 if !self.down.remove(dev) || !self.down.is_empty() || self.chorded {
                     return None;
                 }
                 (mode == Mode::Hold).then_some(Command::Cancel)
             }
         }
+    }
+
+    /// A key pressed during the hold makes it a shortcut.
+    fn chord(&mut self, mode: Mode) -> Option<Command> {
+        if self.down.is_empty() || self.chorded {
+            return None;
+        }
+        self.chorded = true;
+        (mode == Mode::Hold).then_some(Command::Cancel)
     }
 }
 
@@ -392,6 +429,42 @@ mod tests {
     }
 
     #[test]
+    fn modifier_held_before_the_hotkey_makes_a_shortcut() {
+        const CTRL: Input = Input::ModifierDown(KeyCode::KEY_LEFTCTRL);
+        const CTRL_UP: Input = Input::ModifierUp(KeyCode::KEY_LEFTCTRL);
+        // Ctrl+hotkey neither toggles nor starts.
+        let ctrl_tap = [
+            (KBD, CTRL, 0),
+            (KBD, Input::HotkeyDown, 50),
+            (KBD, Input::HotkeyUp, 600),
+            (KBD, CTRL_UP, 700),
+            // Once Ctrl is up, the hotkey works again.
+            (KBD, Input::HotkeyDown, 800),
+            (KBD, Input::HotkeyUp, 900),
+        ];
+        assert_eq!(run(Mode::Toggle, &ctrl_tap), [Command::Toggle]);
+        assert_eq!(
+            run(Mode::Hold, &ctrl_tap),
+            [Command::Start, Command::Cancel]
+        );
+        // A modifier held on a vanished device no longer counts.
+        let lost = [
+            (KBD, CTRL, 0),
+            (KBD, Input::Lost, 10),
+            (OTHER, Input::HotkeyDown, 20),
+            (OTHER, Input::HotkeyUp, 100),
+        ];
+        assert_eq!(run(Mode::Toggle, &lost), [Command::Toggle]);
+        // A letter still down from typing doesn't block dictation.
+        let rollover = [
+            (KBD, Input::OtherKey, 0),
+            (KBD, Input::HotkeyDown, 30),
+            (KBD, Input::HotkeyUp, 400),
+        ];
+        assert_eq!(run(Mode::Hold, &rollover), [Command::Start, Command::Stop]);
+    }
+
+    #[test]
     fn shortcut_never_toggles() {
         let chord = [
             (KBD, Input::HotkeyDown, 0),
@@ -441,5 +514,9 @@ mod tests {
         assert_eq!(press(KeyCode::KEY_FN), Some(Input::OtherKey));
         assert_eq!(press(KeyCode::BTN_LEFT), None);
         assert_eq!(press(KeyCode::BTN_TOUCH), None);
+        assert_eq!(
+            press(KeyCode::KEY_LEFTSHIFT),
+            Some(Input::ModifierDown(KeyCode::KEY_LEFTSHIFT))
+        );
     }
 }

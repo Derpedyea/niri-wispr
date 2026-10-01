@@ -35,8 +35,8 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
   app global so the service stays alive without any windows.
 - `app.rs` — GPUI pill UI + command pump (`cx.spawn` + `timer` poll of `mpsc::Receiver`),
   state machine Idle → Recording → Transcribing → Cleaning → Typing. Capture starts on Start,
-  but the beep and pill wait `hotkey::MIN_HOLD` (250ms), so taps and shortcuts the hotkey
-  cancels before then stay invisible. Creates the pill
+  but the beep and pill — or a start failure (no API key, no mic) — wait `hotkey::MIN_HOLD`
+  (250ms), so taps and shortcuts the hotkey cancels before then stay invisible. Creates the pill
   only while active or showing a message, and removes the native window when idle.
   Active recording shows a 21-sample waveform from measured input levels. Window creation
   runs outside the view update because opening a GPUI window renders its root immediately.
@@ -50,7 +50,8 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
 - `hotkey.rs` — evdev: watches every readable `/dev/input/event*` supporting the hotkey.
   One hold state is shared across devices. Hold mode: press→Start, release→Stop (Cancel if
   held under `MIN_HOLD` — timed here from key events, since the app sees commands late), any other
-  key during the hold→Cancel (it's a shortcut like RightCtrl+C). Toggle mode: release of a
+  key during the hold→Cancel (it's a shortcut like RightCtrl+C); a Ctrl/Shift/Alt/Super already
+  held at press makes it a shortcut too (Ctrl+C with hotkey C). Toggle mode: release of a
   lone tap→Toggle. No time debounce — one dropped a quick tap's release and left recordings running.
 - `typer.rs` — evdev uinput virtual keyboard; types text into whatever window is focused.
 - `beep.rs` — start/stop/error audio cues; WAVs generated once into `dirs::cache_dir()/dictationapp`,

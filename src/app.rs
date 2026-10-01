@@ -15,6 +15,12 @@ use std::time::{Duration, Instant};
 
 pub enum Status {
     Idle,
+    /// Starting failed, but `error` waits like a recording's cue — see
+    /// `cue_if_due` — so a tap or shortcut the hotkey cancels stays silent.
+    StartFailed {
+        started: Instant,
+        error: &'static str,
+    },
     /// `cued` once the beep played and the pill appeared — see `cue_if_due`.
     Recording {
         started: Instant,
@@ -156,6 +162,7 @@ impl DictationView {
             Command::Toggle => match self.status {
                 Status::Recording { .. } => self.stop_and_transcribe(cx),
                 Status::Idle => self.start_recording(cx),
+                Status::StartFailed { error, .. } => self.show_start_failure(error),
                 _ => {}
             },
             Command::Start => {
@@ -163,13 +170,16 @@ impl DictationView {
                     self.start_recording(cx);
                 }
             }
-            Command::Stop => {
-                if matches!(self.status, Status::Recording { .. }) {
-                    self.stop_and_transcribe(cx);
-                }
-            }
+            Command::Stop => match self.status {
+                Status::Recording { .. } => self.stop_and_transcribe(cx),
+                Status::StartFailed { error, .. } => self.show_start_failure(error),
+                _ => {}
+            },
             Command::Cancel => {
-                if matches!(self.status, Status::Recording { .. }) {
+                if matches!(
+                    self.status,
+                    Status::Recording { .. } | Status::StartFailed { .. }
+                ) {
                     self.recording = None;
                     self.status = Status::Idle;
                     self.reset_waveform();
@@ -207,55 +217,71 @@ impl DictationView {
     }
 
     fn start_recording(&mut self, _cx: &mut Context<Self>) {
-        if self.config.api_key.is_none() {
-            eprintln!("no api key configured");
-            self.show_error("Add an OpenRouter API key in Settings.");
-            return;
-        }
         // Before opening the mic, so its latency counts toward the cue delay.
         let started = Instant::now();
-        match audio::start(self.config.mic.as_deref()) {
-            Ok(rec) => {
-                eprintln!("recording started ({} Hz)", rec.sample_rate);
-                self.recording = Some(rec);
-                self.status = Status::Recording {
-                    started,
-                    cued: false,
-                };
-                self.reset_waveform();
-            }
-            Err(e) => {
-                eprintln!("audio start failed: {e:#}");
-                if self.config.beeps {
-                    beep::error();
+        let error = if self.config.api_key.is_none() {
+            eprintln!("no api key configured");
+            "Add an OpenRouter API key in Settings."
+        } else {
+            match audio::start(self.config.mic.as_deref()) {
+                Ok(rec) => {
+                    eprintln!("recording started ({} Hz)", rec.sample_rate);
+                    self.recording = Some(rec);
+                    self.status = Status::Recording {
+                        started,
+                        cued: false,
+                    };
+                    self.reset_waveform();
+                    return;
                 }
-                self.show_error(if self.config.mic.is_some() {
-                    "Microphone unavailable — check Settings → Microphone."
-                } else {
-                    "Microphone unavailable. Check your input device."
-                });
+                Err(e) => {
+                    eprintln!("audio start failed: {e:#}");
+                    if self.config.mic.is_some() {
+                        "Microphone unavailable — check Settings → Microphone."
+                    } else {
+                        "Microphone unavailable. Check your input device."
+                    }
+                }
             }
-        }
+        };
+        self.status = Status::StartFailed { started, error };
     }
 
-    /// Capture starts at once so no speech is lost, but the beep and pill wait
-    /// until the recording has run `MIN_HOLD`, so the taps and shortcuts the
-    /// hotkey cancels before then stay invisible. Returns whether it cued.
-    fn cue_if_due(&mut self) -> bool {
-        let Status::Recording { started, cued } = &mut self.status else {
-            return false;
-        };
-        if *cued || started.elapsed() < hotkey::MIN_HOLD {
-            return false;
-        }
-        *cued = true;
+    fn show_start_failure(&mut self, error: &'static str) {
+        self.status = Status::Idle;
         if self.config.beeps {
-            beep::start();
+            beep::error();
         }
-        self.clear_message();
-        // A recent notice can keep the previous pill open between recordings.
-        if self.window.is_some() {
-            niri::reposition();
+        self.show_error(error);
+    }
+
+    /// Capture starts at once so no speech is lost, but the beep and pill — or
+    /// a start failure — wait until `MIN_HOLD` has passed, so the taps and
+    /// shortcuts the hotkey cancels before then stay invisible. Returns
+    /// whether anything was shown.
+    fn cue_if_due(&mut self) -> bool {
+        match self.status {
+            Status::StartFailed { started, error } if started.elapsed() >= hotkey::MIN_HOLD => {
+                self.show_start_failure(error);
+            }
+            Status::Recording {
+                started,
+                cued: false,
+            } if started.elapsed() >= hotkey::MIN_HOLD => {
+                self.status = Status::Recording {
+                    started,
+                    cued: true,
+                };
+                if self.config.beeps {
+                    beep::start();
+                }
+                self.clear_message();
+                // A recent notice can keep the previous pill open between recordings.
+                if self.window.is_some() {
+                    niri::reposition();
+                }
+            }
+            _ => return false,
         }
         true
     }
@@ -463,6 +489,7 @@ impl DictationView {
     fn shows_status(&self) -> bool {
         match self.status {
             Status::Recording { cued, .. } => cued,
+            Status::StartFailed { .. } => false,
             _ => self.status.is_active(),
         }
     }
@@ -522,13 +549,13 @@ impl DictationView {
             Status::Transcribing => "Transcribing".to_string(),
             Status::Cleaning => "Refining".to_string(),
             Status::Typing => "Inserting".to_string(),
-            Status::Idle => String::new(),
+            Status::Idle | Status::StartFailed { .. } => String::new(),
         }
     }
 
     fn dot_color(&self) -> u32 {
         match &self.status {
-            Status::Idle => {
+            Status::Idle | Status::StartFailed { .. } => {
                 if self.error.is_some() {
                     0xff6b6b
                 } else {
