@@ -35,8 +35,8 @@ const BAR_COUNT: usize = 21;
 const ERROR_DURATION: Duration = Duration::from_secs(4);
 const NOTICE_DURATION: Duration = Duration::from_millis(2500);
 /// Shorter holds are taps or shortcuts (RightCtrl+C). Capture starts at once so
-/// no speech is lost, but the beep and pill wait this long, and a recording
-/// that ends before them is dropped silently.
+/// no speech is lost, but the beep and pill wait this long, and a shorter
+/// recording is dropped silently.
 const CUE_DELAY: Duration = Duration::from_millis(250);
 
 fn normalize_level(level: f32) -> f32 {
@@ -266,7 +266,12 @@ impl DictationView {
         let Some(rec) = self.recording.take() else {
             return;
         };
-        let cued = matches!(self.status, Status::Recording { cued: true, .. });
+        // Timed here, not read from `cued`: the pump handles this Stop before it
+        // checks the cue, so a hold just past CUE_DELAY may not be cued yet.
+        let tap = matches!(
+            self.status,
+            Status::Recording { started, .. } if started.elapsed() < CUE_DELAY
+        );
         let (samples, sample_rate) = rec.finish();
         self.reset_waveform();
         let peak = samples.iter().fold(0.0f32, |a, &s| a.max(s.abs()));
@@ -276,7 +281,7 @@ impl DictationView {
             peak
         );
 
-        if !cued {
+        if tap {
             self.status = Status::Idle;
             return;
         }
