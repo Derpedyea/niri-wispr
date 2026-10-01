@@ -7,9 +7,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ipc::Command;
+
+/// Hold-mode releases sooner than this are taps or shortcuts, not dictation:
+/// they cancel instead of stopping. Timed here from the key events because the
+/// app sees commands late (pump interval, mic setup).
+pub const MIN_HOLD: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -39,28 +44,49 @@ fn classify(ev: &InputEvent, key: KeyCode) -> Option<Input> {
     match (ev.code() == key.code(), ev.value()) {
         (true, 1) => Some(Input::HotkeyDown),
         (true, 0) => Some(Input::HotkeyUp),
-        // Keyboard keys only; mouse and touchpad buttons start at BTN_0.
-        (false, 1) if ev.code() < KeyCode::BTN_0.code() => Some(Input::OtherKey),
+        (false, 1) if !is_button(KeyCode(ev.code())) => Some(Input::OtherKey),
         _ => None,
     }
 }
 
+/// Pointer, touch, and gamepad buttons. Every other key code is a keyboard
+/// key — including those numbered past the first button range, like KEY_OK.
+fn is_button(code: KeyCode) -> bool {
+    [
+        KeyCode::BTN_0..=KeyCode::BTN_GEAR_UP,
+        KeyCode::BTN_DPAD_UP..=KeyCode::BTN_DPAD_RIGHT,
+        KeyCode::BTN_TRIGGER_HAPPY1..=KeyCode::BTN_TRIGGER_HAPPY40,
+    ]
+    .iter()
+    .any(|buttons| buttons.contains(&code))
+}
+
 /// Hotkey state shared by every device listener, so overlapping holds from
 /// several devices count as one gesture and a chord on any keyboard counts.
-#[derive(Default)]
 struct Hold {
     /// Devices currently holding the hotkey down.
     down: HashSet<PathBuf>,
+    /// When the current hold began; only meaningful while `down` is non-empty.
+    since: Instant,
     /// Another key was pressed during this hold: it's a shortcut like
     /// RightCtrl+C, not dictation.
     chorded: bool,
 }
 
 impl Hold {
-    /// Apply one input from `dev`; returns the command to send, if any.
-    /// Hold mode starts on press so no speech is lost, and a chord cancels.
-    /// Toggle mode waits for the release so a chord never toggles.
-    fn apply(&mut self, dev: &Path, input: Input, mode: Mode) -> Option<Command> {
+    fn new() -> Hold {
+        Hold {
+            down: HashSet::new(),
+            since: Instant::now(),
+            chorded: false,
+        }
+    }
+
+    /// Apply one input from `dev` at `now`; returns the command to send, if
+    /// any. Hold mode starts on press so no speech is lost; a chord or a
+    /// release before MIN_HOLD cancels. Toggle mode waits for the release so a
+    /// chord never toggles.
+    fn apply(&mut self, dev: &Path, input: Input, mode: Mode, now: Instant) -> Option<Command> {
         match input {
             Input::HotkeyDown => {
                 let fresh = self.down.is_empty();
@@ -68,6 +94,7 @@ impl Hold {
                 if !fresh {
                     return None;
                 }
+                self.since = now;
                 self.chorded = false;
                 (mode == Mode::Hold).then_some(Command::Start)
             }
@@ -78,6 +105,7 @@ impl Hold {
                     return None;
                 }
                 Some(match mode {
+                    Mode::Hold if now.duration_since(self.since) < MIN_HOLD => Command::Cancel,
                     Mode::Hold => Command::Stop,
                     Mode::Toggle => Command::Toggle,
                 })
@@ -129,7 +157,7 @@ impl Watcher {
     pub fn start(key: KeyCode, mode: Mode, tx: Sender<Command>) -> Result<Watcher> {
         let stop = Arc::new(AtomicBool::new(false));
         let watched = Arc::new(Mutex::new(HashSet::new()));
-        let hold = Arc::new(Mutex::new(Hold::default()));
+        let hold = Arc::new(Mutex::new(Hold::new()));
         let mut failed = HashSet::new();
         scan_devices(key, mode, &tx, &watched, &hold, &mut failed, &stop);
         eprintln!(
@@ -233,7 +261,7 @@ fn watch_device(
     // transitions that produced them across device threads.
     let apply = |input| {
         let mut hold = hold.lock().unwrap();
-        if let Some(cmd) = hold.apply(path, input, mode) {
+        if let Some(cmd) = hold.apply(path, input, mode, Instant::now()) {
             let _ = tx.send(cmd);
         }
     };
@@ -266,15 +294,14 @@ mod tests {
     use super::*;
     use crate::typer::Typer;
     use std::sync::mpsc::channel;
-    use std::time::Instant;
 
     /// A quick tap on the virtual uinput keyboard must reach the listener as a
-    /// full Start/Stop pair — proves the whole hotkey path works on this
+    /// full Start/Cancel pair — proves the whole hotkey path works on this
     /// machine, and regresses the debounce that dropped releases under 80ms,
     /// leaving a recording running until the next press.
     /// F24 is used so a running instance's configured hotkey can't fire.
     #[test]
-    fn quick_tap_reaches_listener_as_start_and_stop() {
+    fn quick_tap_reaches_listener_as_start_and_cancel() {
         let mut typer = Typer::new().expect("uinput must be writable");
         thread::sleep(Duration::from_millis(500));
 
@@ -285,7 +312,7 @@ mod tests {
         thread::sleep(Duration::from_millis(10));
         typer.emit(KeyCode::KEY_F24, 0).unwrap();
 
-        for expected in [Command::Start, Command::Stop] {
+        for expected in [Command::Start, Command::Cancel] {
             let cmd = rx
                 .recv_timeout(Duration::from_secs(3))
                 .unwrap_or_else(|e| panic!("expected {expected:?}: {e}"));
@@ -323,11 +350,15 @@ mod tests {
         drop(watcher);
     }
 
-    fn run(mode: Mode, inputs: &[(&str, Input)]) -> Vec<Command> {
-        let mut hold = Hold::default();
+    /// Feed `(device, input, ms since the first input)` through one Hold.
+    fn run(mode: Mode, inputs: &[(&str, Input, u64)]) -> Vec<Command> {
+        let mut hold = Hold::new();
+        let t0 = Instant::now();
         inputs
             .iter()
-            .filter_map(|(dev, input)| hold.apply(Path::new(dev), *input, mode))
+            .filter_map(|&(dev, input, ms)| {
+                hold.apply(Path::new(dev), input, mode, t0 + Duration::from_millis(ms))
+            })
             .collect()
     }
 
@@ -335,14 +366,26 @@ mod tests {
     const OTHER: &str = "/dev/input/event2";
 
     #[test]
+    fn hold_shorter_than_min_hold_is_a_tap() {
+        let hold = |ms| {
+            run(
+                Mode::Hold,
+                &[(KBD, Input::HotkeyDown, 0), (KBD, Input::HotkeyUp, ms)],
+            )
+        };
+        assert_eq!(hold(249), [Command::Start, Command::Cancel]);
+        assert_eq!(hold(250), [Command::Start, Command::Stop]);
+    }
+
+    #[test]
     fn shortcut_cancels_hold_instead_of_transcribing() {
         let cmds = run(
             Mode::Hold,
             &[
-                (KBD, Input::HotkeyDown),
-                (KBD, Input::OtherKey),
-                (KBD, Input::OtherKey),
-                (KBD, Input::HotkeyUp),
+                (KBD, Input::HotkeyDown, 0),
+                (KBD, Input::OtherKey, 300),
+                (KBD, Input::OtherKey, 350),
+                (KBD, Input::HotkeyUp, 600),
             ],
         );
         assert_eq!(cmds, [Command::Start, Command::Cancel]);
@@ -351,12 +394,12 @@ mod tests {
     #[test]
     fn shortcut_never_toggles() {
         let chord = [
-            (KBD, Input::HotkeyDown),
-            (OTHER, Input::OtherKey),
-            (KBD, Input::HotkeyUp),
+            (KBD, Input::HotkeyDown, 0),
+            (OTHER, Input::OtherKey, 100),
+            (KBD, Input::HotkeyUp, 200),
         ];
         assert_eq!(run(Mode::Toggle, &chord), []);
-        let tap = [(KBD, Input::HotkeyDown), (KBD, Input::HotkeyUp)];
+        let tap = [(KBD, Input::HotkeyDown, 0), (KBD, Input::HotkeyUp, 50)];
         assert_eq!(run(Mode::Toggle, &tap), [Command::Toggle]);
     }
 
@@ -365,10 +408,10 @@ mod tests {
         let cmds = run(
             Mode::Toggle,
             &[
-                (KBD, Input::HotkeyDown),
-                (OTHER, Input::HotkeyDown),
-                (KBD, Input::HotkeyUp),
-                (OTHER, Input::HotkeyUp),
+                (KBD, Input::HotkeyDown, 0),
+                (OTHER, Input::HotkeyDown, 5),
+                (KBD, Input::HotkeyUp, 100),
+                (OTHER, Input::HotkeyUp, 105),
             ],
         );
         assert_eq!(cmds, [Command::Toggle]);
@@ -376,9 +419,27 @@ mod tests {
 
     #[test]
     fn losing_the_holding_device_cancels() {
-        let cmds = run(Mode::Hold, &[(KBD, Input::HotkeyDown), (KBD, Input::Lost)]);
+        let cmds = run(
+            Mode::Hold,
+            &[(KBD, Input::HotkeyDown, 0), (KBD, Input::Lost, 900)],
+        );
         assert_eq!(cmds, [Command::Start, Command::Cancel]);
         // A release from a hold this listener never saw does nothing.
-        assert_eq!(run(Mode::Hold, &[(KBD, Input::HotkeyUp)]), []);
+        assert_eq!(run(Mode::Hold, &[(KBD, Input::HotkeyUp, 0)]), []);
+    }
+
+    #[test]
+    fn keys_past_the_button_ranges_still_chord() {
+        let press = |key: KeyCode| {
+            classify(
+                &InputEvent::new(EventType::KEY.0, key.code(), 1),
+                KeyCode::KEY_RIGHTCTRL,
+            )
+        };
+        assert_eq!(press(KeyCode::KEY_C), Some(Input::OtherKey));
+        assert_eq!(press(KeyCode::KEY_OK), Some(Input::OtherKey));
+        assert_eq!(press(KeyCode::KEY_FN), Some(Input::OtherKey));
+        assert_eq!(press(KeyCode::BTN_LEFT), None);
+        assert_eq!(press(KeyCode::BTN_TOUCH), None);
     }
 }

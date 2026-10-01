@@ -116,8 +116,8 @@ cleanup_model = "inclusionai/ling-3.0-flash"
 - **`hold`** — press and hold the hotkey; release to transcribe.
 - **`toggle`** — tap once to start, again to stop.
 
-Taps under ¼ second are ignored, and using the hotkey in a shortcut
-(Right Ctrl+C) never starts a dictation.
+In hold mode, taps under ¼ second are ignored. In either mode, using the
+hotkey in a shortcut (Right Ctrl+C) never starts a dictation.
 
 ## niri setup
 

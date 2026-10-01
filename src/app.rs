@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::hotkey::Watcher;
 use crate::ipc::Command;
 use crate::typer::Typer;
-use crate::{api, audio, beep, niri, settings};
+use crate::{api, audio, beep, hotkey, niri, settings};
 use gpui::{
     App, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, MouseButton,
     MouseDownEvent, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance,
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 pub enum Status {
     Idle,
-    /// `cued` once the beep played and the pill appeared — see CUE_DELAY.
+    /// `cued` once the beep played and the pill appeared — see `cue_if_due`.
     Recording {
         started: Instant,
         cued: bool,
@@ -34,10 +34,6 @@ impl Status {
 const BAR_COUNT: usize = 21;
 const ERROR_DURATION: Duration = Duration::from_secs(4);
 const NOTICE_DURATION: Duration = Duration::from_millis(2500);
-/// Shorter holds are taps or shortcuts (RightCtrl+C). Capture starts at once so
-/// no speech is lost, but the beep and pill wait this long, and a shorter
-/// recording is dropped silently.
-const CUE_DELAY: Duration = Duration::from_millis(250);
 
 fn normalize_level(level: f32) -> f32 {
     ((level - 0.02) / 0.55).clamp(0.0, 1.0).powf(0.7)
@@ -216,7 +212,7 @@ impl DictationView {
             self.show_error("Add an OpenRouter API key in Settings.");
             return;
         }
-        // Before opening the mic, so its latency counts toward CUE_DELAY.
+        // Before opening the mic, so its latency counts toward the cue delay.
         let started = Instant::now();
         match audio::start(self.config.mic.as_deref()) {
             Ok(rec) => {
@@ -242,12 +238,14 @@ impl DictationView {
         }
     }
 
-    /// Announce a recording once it outlasts CUE_DELAY. Returns whether it did.
+    /// Capture starts at once so no speech is lost, but the beep and pill wait
+    /// until the recording has run `MIN_HOLD`, so the taps and shortcuts the
+    /// hotkey cancels before then stay invisible. Returns whether it cued.
     fn cue_if_due(&mut self) -> bool {
         let Status::Recording { started, cued } = &mut self.status else {
             return false;
         };
-        if *cued || started.elapsed() < CUE_DELAY {
+        if *cued || started.elapsed() < hotkey::MIN_HOLD {
             return false;
         }
         *cued = true;
@@ -266,12 +264,6 @@ impl DictationView {
         let Some(rec) = self.recording.take() else {
             return;
         };
-        // Timed here, not read from `cued`: the pump handles this Stop before it
-        // checks the cue, so a hold just past CUE_DELAY may not be cued yet.
-        let tap = matches!(
-            self.status,
-            Status::Recording { started, .. } if started.elapsed() < CUE_DELAY
-        );
         let (samples, sample_rate) = rec.finish();
         self.reset_waveform();
         let peak = samples.iter().fold(0.0f32, |a, &s| a.max(s.abs()));
@@ -280,11 +272,6 @@ impl DictationView {
             samples.len() as f32 / sample_rate as f32,
             peak
         );
-
-        if tap {
-            self.status = Status::Idle;
-            return;
-        }
 
         if samples.len() < sample_rate as usize / 4 {
             self.status = Status::Idle;
