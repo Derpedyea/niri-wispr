@@ -15,7 +15,11 @@ use std::time::{Duration, Instant};
 
 pub enum Status {
     Idle,
-    Recording { started: Instant },
+    /// `cued` once the beep played and the pill appeared — see CUE_DELAY.
+    Recording {
+        started: Instant,
+        cued: bool,
+    },
     Transcribing,
     Cleaning,
     Typing,
@@ -30,6 +34,10 @@ impl Status {
 const BAR_COUNT: usize = 21;
 const ERROR_DURATION: Duration = Duration::from_secs(4);
 const NOTICE_DURATION: Duration = Duration::from_millis(2500);
+/// Shorter holds are taps or shortcuts (RightCtrl+C). Capture starts at once so
+/// no speech is lost, but the beep and pill wait this long, and a recording
+/// that ends before them is dropped silently.
+const CUE_DELAY: Duration = Duration::from_millis(250);
 
 fn normalize_level(level: f32) -> f32 {
     ((level - 0.02) / 0.55).clamp(0.0, 1.0).powf(0.7)
@@ -109,6 +117,7 @@ impl DictationView {
                         view.handle_command(cmd, cx);
                         changed = true;
                     }
+                    changed |= view.cue_if_due();
                     if let Some(level) = view.recording.as_ref().map(|rec| rec.capture.level()) {
                         push_waveform(&mut view.waveform, &mut view.smoothed_level, level);
                         changed = true;
@@ -168,7 +177,6 @@ impl DictationView {
                     self.recording = None;
                     self.status = Status::Idle;
                     self.reset_waveform();
-                    self.clear_message();
                 }
             }
             Command::Quit => cx.quit(),
@@ -208,22 +216,17 @@ impl DictationView {
             self.show_error("Add an OpenRouter API key in Settings.");
             return;
         }
+        // Before opening the mic, so its latency counts toward CUE_DELAY.
+        let started = Instant::now();
         match audio::start(self.config.mic.as_deref()) {
             Ok(rec) => {
                 eprintln!("recording started ({} Hz)", rec.sample_rate);
-                if self.config.beeps {
-                    beep::start();
-                }
                 self.recording = Some(rec);
                 self.status = Status::Recording {
-                    started: Instant::now(),
+                    started,
+                    cued: false,
                 };
                 self.reset_waveform();
-                self.clear_message();
-                // A recent notice can keep the previous pill open between recordings.
-                if self.window.is_some() {
-                    niri::reposition();
-                }
             }
             Err(e) => {
                 eprintln!("audio start failed: {e:#}");
@@ -239,10 +242,31 @@ impl DictationView {
         }
     }
 
+    /// Announce a recording once it outlasts CUE_DELAY. Returns whether it did.
+    fn cue_if_due(&mut self) -> bool {
+        let Status::Recording { started, cued } = &mut self.status else {
+            return false;
+        };
+        if *cued || started.elapsed() < CUE_DELAY {
+            return false;
+        }
+        *cued = true;
+        if self.config.beeps {
+            beep::start();
+        }
+        self.clear_message();
+        // A recent notice can keep the previous pill open between recordings.
+        if self.window.is_some() {
+            niri::reposition();
+        }
+        true
+    }
+
     fn stop_and_transcribe(&mut self, cx: &mut Context<Self>) {
         let Some(rec) = self.recording.take() else {
             return;
         };
+        let cued = matches!(self.status, Status::Recording { cued: true, .. });
         let (samples, sample_rate) = rec.finish();
         self.reset_waveform();
         let peak = samples.iter().fold(0.0f32, |a, &s| a.max(s.abs()));
@@ -251,6 +275,11 @@ impl DictationView {
             samples.len() as f32 / sample_rate as f32,
             peak
         );
+
+        if !cued {
+            self.status = Status::Idle;
+            return;
+        }
 
         if samples.len() < sample_rate as usize / 4 {
             self.status = Status::Idle;
@@ -438,8 +467,16 @@ impl DictationView {
         self.message_expires_at = Some(Instant::now() + NOTICE_DURATION);
     }
 
+    /// Whether the pill shows the status rather than a message.
+    fn shows_status(&self) -> bool {
+        match self.status {
+            Status::Recording { cued, .. } => cued,
+            _ => self.status.is_active(),
+        }
+    }
+
     fn pill_visible(&self) -> bool {
-        self.status.is_active() || self.error.is_some() || self.notice.is_some()
+        self.shows_status() || self.error.is_some() || self.notice.is_some()
     }
 
     /// An invisible toplevel still captures focus on niri, even with an empty
@@ -486,7 +523,7 @@ impl DictationView {
 
     fn status_label(&self) -> String {
         match &self.status {
-            Status::Recording { started } => {
+            Status::Recording { started, .. } => {
                 let secs = started.elapsed().as_secs();
                 format!("{}:{:02}", secs / 60, secs % 60)
             }
@@ -541,7 +578,7 @@ impl Render for DictationView {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_pill_click))
             .child(div().size(px(8.0)).rounded_full().bg(rgb(self.dot_color())));
 
-        let pill = if matches!(self.status, Status::Idle) {
+        let pill = if !self.shows_status() {
             let message = self
                 .error
                 .clone()
@@ -617,7 +654,8 @@ mod tests {
         assert!(!Status::Idle.is_active());
         assert!(
             Status::Recording {
-                started: Instant::now()
+                started: Instant::now(),
+                cued: false,
             }
             .is_active()
         );

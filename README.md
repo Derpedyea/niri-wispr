@@ -114,7 +114,10 @@ cleanup_model = "inclusionai/ling-3.0-flash"
 ```
 
 - **`hold`** — press and hold the hotkey; release to transcribe.
-- **`toggle`** — press once to start, again to stop.
+- **`toggle`** — tap once to start, again to stop.
+
+Taps under ¼ second are ignored, and using the hotkey in a shortcut
+(Right Ctrl+C) never starts a dictation.
 
 ## niri setup
 
@@ -169,8 +172,6 @@ binds {
 - **The hotkey isn't swallowed** — there's no device grab (grabbing would
   break normal typing), so the key also reaches the focused app. Pick an
   inert key like Right Ctrl.
-- **Toggle mode double-fires** — several devices can report the same key.
-  Set `hotkey` to a key only one device emits.
 - **Hear what the model hears** — `dictationapp --record /tmp/speech.wav 5`
   and play it back.
 - Runtime logs go to stderr: `recording started`, `transcript: ...`,
