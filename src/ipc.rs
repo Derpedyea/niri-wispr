@@ -370,9 +370,29 @@ mod tests {
 
     #[test]
     fn instance_lock_covers_stale_recovery_and_shutdown() {
+        const STALE_SOCKET: &str = "DICTATION_TEST_STALE_SOCKET";
+        if let Some(path) = std::env::var_os(STALE_SOCKET) {
+            // This isolated process never forks while its listener is open.
+            // Its exit proves no inherited descriptor keeps the socket live.
+            drop(UnixListener::bind(PathBuf::from(path)).unwrap());
+            return;
+        }
         let dir = TestDir::new();
-        let stale = UnixListener::bind(dir.socket()).unwrap();
-        drop(stale);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ipc::tests::instance_lock_covers_stale_recovery_and_shutdown",
+                "--nocapture",
+            ])
+            .env(STALE_SOCKET, dir.socket())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         let (tx, _rx) = mpsc::channel();
         let server = listen_at(dir.socket(), tx.clone(), SERVER_TIMEOUT).unwrap();
         let inode = std::fs::metadata(dir.socket().with_extension("lock"))
