@@ -27,7 +27,7 @@ if name == "git":
     if args[0] == "clone":
         pathlib.Path(args[-1]).mkdir(mode=0o755)
     if "diff" in args:
-        sys.exit(1)
+        sys.exit(128 if os.environ.get("PUBLISH_TEST_DIFF_FAIL") == "1" else 1)
     sys.exit(0)
 if name == "curl":
     if os.environ.get("PUBLISH_TEST_DOWNLOAD_FAIL") == "1":
@@ -74,7 +74,7 @@ raise SystemExit("unexpected mocked tool: " + name)
 
 class PublishTests(unittest.TestCase):
     def run_publish(self, *, root=False, download_fail=False, makepkg_fail=False,
-                    cleanup_fail_once=False):
+                    cleanup_fail_once=False, diff_fail=False):
         with tempfile.TemporaryDirectory(prefix="aur-publish-test-", dir="/tmp") as tmp:
             directory = Path(tmp)
             bins = directory / "bin"
@@ -91,6 +91,7 @@ class PublishTests(unittest.TestCase):
                        PUBLISH_TEST_LOG=str(log), PUBLISH_TEST_SNAPSHOT=str(snapshot),
                        PUBLISH_TEST_DOWNLOAD_FAIL=str(int(download_fail)),
                        PUBLISH_TEST_MAKEPKG_FAIL=str(int(makepkg_fail)),
+                       PUBLISH_TEST_DIFF_FAIL=str(int(diff_fail)),
                        PUBLISH_TEST_CLEANUP_FAIL_ONCE=str(int(cleanup_fail_once)))
             # Source functions only; SSH setup and real publication never run.
             command = ['bash', '-c',
@@ -139,6 +140,12 @@ class PublishTests(unittest.TestCase):
         result, calls, _ = self.run_publish(cleanup_fail_once=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sum(name == "rm" for name, _ in calls), 2)
+
+    def test_failed_diff_aborts_before_commit_or_push(self):
+        result, calls, _ = self.run_publish(diff_fail=True)
+        self.assertEqual(result.returncode, 128)
+        self.assertFalse(any(name == "git" and ("commit" in args or "push" in args)
+                             for name, args in calls))
 
 
 if __name__ == "__main__":

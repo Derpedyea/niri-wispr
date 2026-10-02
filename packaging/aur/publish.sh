@@ -38,7 +38,7 @@ prepare_workdir() {
 }
 
 publish() {
-  local pkg="$1" template="$2" src_url="$3" dir checksum
+  local pkg="$1" template="$2" src_url="$3" dir checksum diff_status
   dir="$WORK_DIR/$pkg"
 
   echo "=== $pkg $VERSION ==="
@@ -72,6 +72,12 @@ publish() {
   if git -c "safe.directory=$dir" -C "$dir" diff --cached --quiet; then
     echo "$pkg is already up to date"
     return
+  else
+    diff_status=$?
+    if [ "$diff_status" -ne 1 ]; then
+      echo "::error::could not check staged changes for $pkg" >&2
+      return "$diff_status"
+    fi
   fi
   git -c "safe.directory=$dir" -C "$dir" commit -m "v$VERSION"
   git -c "safe.directory=$dir" -C "$dir" push origin HEAD:master
