@@ -204,7 +204,12 @@ impl DictationView {
                 self.prepare_quit();
                 cx.quit();
             }
-            Command::Settings => settings::open(cx, self.tx.clone()),
+            Command::Settings => {
+                if let Err(error) = settings::open(cx, self.tx.clone()) {
+                    eprintln!("settings: {error:#}");
+                    self.show_error("Unable to load settings. Check config.toml.");
+                }
+            }
             Command::Reload => self.reload_config(),
         }
     }
@@ -1060,6 +1065,48 @@ mod tests {
             .env(CHILD, "1")
             .env("XDG_CONFIG_HOME", directory.path())
             .env_remove("OPENROUTER_API_KEY")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[gpui::test]
+    fn malformed_config_never_opens_writable_settings(cx: &mut TestAppContext) {
+        const CHILD: &str = "DICTATION_TEST_SETTINGS_LOAD_FAILURE";
+        if std::env::var_os(CHILD).is_some() {
+            let path = Config::default_path();
+            let original = std::fs::read(&path).unwrap();
+            let view = view(cx, false);
+            view.update(cx, |view, cx| {
+                view.handle_command(Command::Settings, cx);
+                assert!(view.error.is_some());
+                assert!(cx.windows().is_empty());
+            });
+            assert_eq!(std::fs::read(path).unwrap(), original);
+            return;
+        }
+
+        // The invalid config belongs to an isolated child, never the user.
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("dictationapp")).unwrap();
+        std::fs::write(
+            directory.path().join("dictationapp/config.toml"),
+            "api_key = [malformed\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "app::tests::malformed_config_never_opens_writable_settings",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("XDG_CONFIG_HOME", directory.path())
             .output()
             .unwrap();
         assert!(

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use evdev::{Device, EventType, InputEvent, KeyCode};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -352,6 +352,23 @@ struct Devices {
     generation: u64,
 }
 
+/// Merge keyboards by event time without reversing any device's event sequence.
+/// Realtime clock rollback (or synthetic resync events) can lower a timestamp;
+/// preserve the original time for Hold to reject an uncertain duration.
+fn order_inputs(inputs: Vec<(SystemTime, PathBuf, Input)>) -> Vec<(SystemTime, PathBuf, Input)> {
+    let mut latest = HashMap::new();
+    let mut ordered = inputs
+        .into_iter()
+        .map(|(at, path, input)| {
+            let previous = latest.entry(path.clone()).or_insert(at);
+            *previous = (*previous).max(at);
+            (*previous, (at, path, input))
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(at, _)| *at);
+    ordered.into_iter().map(|(_, input)| input).collect()
+}
+
 impl Devices {
     fn scan(&mut self) -> Result<()> {
         let entries = std::fs::read_dir("/dev/input").context("unable to enumerate /dev/input")?;
@@ -442,8 +459,7 @@ impl Devices {
                     }
                 }
             }
-            inputs.sort_by_key(|(at, _, _)| *at);
-            for (at, path, input) in inputs {
+            for (at, path, input) in order_inputs(inputs) {
                 if stop.is_stopped()
                     || send_hotkey(
                         &self.tx,
@@ -607,25 +623,24 @@ mod tests {
     #[test]
     fn clock_rollback_discards_the_recording() {
         let mut hold = Hold::new();
-        let path = Path::new(KBD);
-        assert_eq!(
-            hold.apply(
-                path,
+        let inputs = vec![
+            (
+                SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+                PathBuf::from(KBD),
                 Input::HotkeyDown,
-                Mode::Hold,
-                SystemTime::UNIX_EPOCH + Duration::from_secs(2)
             ),
-            Some(HotkeyCommand::Start)
-        );
-        assert_eq!(
-            hold.apply(
-                path,
+            (
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                PathBuf::from(KBD),
                 Input::HotkeyUp,
-                Mode::Hold,
-                SystemTime::UNIX_EPOCH + Duration::from_secs(1)
             ),
-            Some(HotkeyCommand::Cancel)
-        );
+        ];
+        let commands = order_inputs(inputs)
+            .into_iter()
+            .filter_map(|(at, path, input)| hold.apply(&path, input, Mode::Hold, at))
+            .collect::<Vec<_>>();
+        assert_eq!(commands, [HotkeyCommand::Start, HotkeyCommand::Cancel]);
+        assert!(hold.down.is_empty());
     }
 
     #[test]

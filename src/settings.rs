@@ -4,11 +4,13 @@ use crate::audio;
 use crate::config::Config;
 use crate::hotkey;
 use crate::ipc::Command;
+use anyhow::{Context as _, Result};
 use gpui::{
     App, Bounds, Context, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent,
     SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb,
     rgba,
 };
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
 const MODEL_PRESETS: &[&str] = &[
@@ -36,6 +38,7 @@ enum Field {
 pub struct SettingsView {
     focus_handle: FocusHandle,
     tx: Sender<Command>,
+    config_path: PathBuf,
     // Editable working copy of the config.
     api_key: String,
     model: String,
@@ -65,7 +68,9 @@ fn delete_previous_word(value: &mut String) {
 }
 
 /// Open the settings window. `tx` lets Save notify the pill to reload config.
-pub fn open<V: 'static + Render>(cx: &mut Context<V>, tx: Sender<Command>) {
+pub fn open<V: 'static + Render>(cx: &mut Context<V>, tx: Sender<Command>) -> Result<()> {
+    // Failed reads must not become an editable default that Save could persist.
+    let config = Config::load().context("unable to load settings")?;
     let dims = gpui::size(px(460.0), px(760.0));
     let bounds = Bounds::centered(None, dims, cx);
     let tx2 = tx;
@@ -84,33 +89,22 @@ pub fn open<V: 'static + Render>(cx: &mut Context<V>, tx: Sender<Command>) {
             ..Default::default()
         },
         move |window, cx| {
-            let view = cx.new(|cx| SettingsView::new(tx2, cx));
+            let view = cx.new(|cx| SettingsView::new(config, tx2, cx));
             window.set_window_title("Dictation Settings");
             window.focus(&view.read(cx).focus_handle);
             view
         },
     )
-    .ok();
+    .context("unable to open the settings window")?;
+    Ok(())
 }
 
 impl SettingsView {
-    fn new(tx: Sender<Command>, cx: &mut Context<Self>) -> Self {
-        let cfg = Config::load().unwrap_or_else(|_| Config {
-            api_key: None,
-            model: crate::config::DEFAULT_MODEL.into(),
-            language: None,
-            mode: "hold".into(),
-            hotkey: crate::config::DEFAULT_HOTKEY.into(),
-            mic: None,
-            type_text: true,
-            beeps: true,
-            cleanup: true,
-            cleanup_model: crate::config::DEFAULT_CLEANUP_MODEL.into(),
-            path: crate::config::Config::default_path(),
-        });
+    fn new(cfg: Config, tx: Sender<Command>, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
             tx,
+            config_path: cfg.path,
             api_key: cfg.api_key.unwrap_or_default(),
             model: cfg.model,
             language: cfg.language.unwrap_or_default(),
@@ -297,7 +291,7 @@ impl SettingsView {
             beeps: self.beeps,
             cleanup: self.cleanup,
             cleanup_model: self.cleanup_model.clone(),
-            path: Config::default_path(),
+            path: self.config_path.clone(),
         };
         match cfg.save() {
             Ok(()) => {
