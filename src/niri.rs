@@ -146,5 +146,5 @@ fn msg_json(args: &[&str]) -> Result<serde_json::Value> {
     if !out.status.success() {
         anyhow::bail!("niri msg: {}", String::from_utf8_lossy(&out.stderr));
     }
-    Ok(serde_json::from_slice(&out.stdout).context("bad niri json")?)
+    serde_json::from_slice(&out.stdout).context("bad niri json")
 }

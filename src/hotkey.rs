@@ -3,13 +3,13 @@ use evdev::{Device, EventType, InputEvent, KeyCode};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime};
 
-use crate::ipc::Command;
+use crate::ipc::{Command, HotkeyCommand};
 
 /// Hold-mode releases sooner than this are taps or shortcuts, not dictation:
 /// they cancel instead of stopping. Timed here from the key events because the
@@ -82,13 +82,13 @@ fn is_button(code: KeyCode) -> bool {
     .any(|buttons| buttons.contains(&code))
 }
 
-/// Hotkey state shared by every device listener, so overlapping holds from
-/// several devices count as one gesture and a chord on any keyboard counts.
+/// One state for every watched device, so overlapping holds count as one
+/// gesture and a chord on any keyboard counts.
 struct Hold {
     /// Devices currently holding the hotkey down.
     down: HashSet<PathBuf>,
     /// When the current hold began; only meaningful while `down` is non-empty.
-    since: Instant,
+    since: SystemTime,
     /// Modifiers currently held, per device. Only modifiers: a letter still
     /// down from fast typing must not swallow the dictation that follows.
     modifiers: HashSet<(PathBuf, KeyCode)>,
@@ -101,7 +101,7 @@ impl Hold {
     fn new() -> Hold {
         Hold {
             down: HashSet::new(),
-            since: Instant::now(),
+            since: SystemTime::UNIX_EPOCH,
             modifiers: HashSet::new(),
             chorded: false,
         }
@@ -111,7 +111,13 @@ impl Hold {
     /// any. Hold mode starts on press so no speech is lost; a chord or a
     /// release before MIN_HOLD cancels. Toggle mode waits for the release so a
     /// chord never toggles.
-    fn apply(&mut self, dev: &Path, input: Input, mode: Mode, now: Instant) -> Option<Command> {
+    fn apply(
+        &mut self,
+        dev: &Path,
+        input: Input,
+        mode: Mode,
+        now: SystemTime,
+    ) -> Option<HotkeyCommand> {
         match input {
             Input::HotkeyDown => {
                 let fresh = self.down.is_empty();
@@ -121,7 +127,7 @@ impl Hold {
                 }
                 self.since = now;
                 self.chorded = !self.modifiers.is_empty();
-                (mode == Mode::Hold && !self.chorded).then_some(Command::Start)
+                (mode == Mode::Hold && !self.chorded).then_some(HotkeyCommand::Start)
             }
             // A release we never saw pressed (key already down when the
             // listener attached) is ignored.
@@ -130,9 +136,17 @@ impl Hold {
                     return None;
                 }
                 Some(match mode {
-                    Mode::Hold if now.duration_since(self.since) < MIN_HOLD => Command::Cancel,
-                    Mode::Hold => Command::Stop,
-                    Mode::Toggle => Command::Toggle,
+                    // A wall-clock rollback makes the gesture's duration unknown:
+                    // discard it rather than transcribing an apparent short tap.
+                    Mode::Hold
+                        if !now
+                            .duration_since(self.since)
+                            .is_ok_and(|held| held >= MIN_HOLD) =>
+                    {
+                        HotkeyCommand::Cancel
+                    }
+                    Mode::Hold => HotkeyCommand::Stop,
+                    Mode::Toggle => HotkeyCommand::Toggle,
                 })
             }
             Input::OtherKey => self.chord(mode),
@@ -150,18 +164,18 @@ impl Hold {
                 if !self.down.remove(dev) || !self.down.is_empty() || self.chorded {
                     return None;
                 }
-                (mode == Mode::Hold).then_some(Command::Cancel)
+                (mode == Mode::Hold).then_some(HotkeyCommand::Cancel)
             }
         }
     }
 
     /// A key pressed during the hold makes it a shortcut.
-    fn chord(&mut self, mode: Mode) -> Option<Command> {
+    fn chord(&mut self, mode: Mode) -> Option<HotkeyCommand> {
         if self.down.is_empty() || self.chorded {
             return None;
         }
         self.chorded = true;
-        (mode == Mode::Hold).then_some(Command::Cancel)
+        (mode == Mode::Hold).then_some(HotkeyCommand::Cancel)
     }
 }
 
@@ -180,148 +194,282 @@ fn is_keyboard(dev: &Device) -> bool {
 /// (hot-plug, suspend/resume) or became readable once udev applied their ACL.
 const RESCAN_INTERVAL: Duration = Duration::from_secs(1);
 
-/// A running set of per-device listener threads, plus a supervisor thread that
-/// rescans /dev/input so keyboards appearing later — or re-appearing after
-/// removal — are picked up. Drop-style stop via a shared flag so the hotkey
-/// can be reconfigured at runtime without restarting the app.
+/// All devices belong to one worker. Stop joins it before returning, so reload
+/// can reject its queued generation and cancel capture without any late sends.
 pub struct Watcher {
-    stop: Arc<AtomicBool>,
+    stop: Arc<StopSignal>,
+    worker: Option<JoinHandle<()>>,
+    generation: u64,
 }
 
-impl Watcher {
-    /// Spawn a listener thread per keyboard device and keep the set current as
-    /// devices come and go. Sends commands per `Hold::apply`.
-    pub fn start(key: KeyCode, mode: Mode, tx: Sender<Command>) -> Result<Watcher> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let watched = Arc::new(Mutex::new(HashSet::new()));
-        let hold = Arc::new(Mutex::new(Hold::new()));
-        let mut failed = HashSet::new();
-        scan_devices(key, mode, &tx, &watched, &hold, &mut failed, &stop);
-        eprintln!(
-            "hotkey: {key:?} ({mode:?}) on {} device(s)",
-            watched.lock().unwrap().len()
-        );
-        let watched = Arc::clone(&watched);
-        let stop2 = Arc::clone(&stop);
-        thread::spawn(move || {
-            loop {
-                thread::sleep(RESCAN_INTERVAL);
-                if stop2.load(Ordering::Relaxed) {
-                    return;
-                }
-                scan_devices(key, mode, &tx, &watched, &hold, &mut failed, &stop2);
-            }
-        });
-        Ok(Watcher { stop })
+#[derive(Default)]
+struct StopSignal {
+    stopped: AtomicBool,
+    lock: Mutex<()>,
+    wake: Condvar,
+}
+
+impl StopSignal {
+    fn stop(&self) {
+        let _guard = self.lock.lock().unwrap();
+        self.stopped.store(true, Ordering::SeqCst);
+        self.wake.notify_all();
     }
 
-    /// Stop the current listeners and start fresh ones for a new key/mode.
-    pub fn restart(&mut self, key: KeyCode, mode: Mode, tx: Sender<Command>) -> Result<()> {
-        self.stop.store(true, Ordering::SeqCst);
-        // Let in-flight polls observe the flag before we re-enumerate devices.
-        thread::sleep(Duration::from_millis(50));
-        *self = Self::start(key, mode, tx)?;
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    fn wait(&self, duration: Duration) {
+        let guard = self.lock.lock().unwrap();
+        let _ = self
+            .wake
+            .wait_timeout_while(guard, duration, |_| !self.is_stopped())
+            .unwrap();
+    }
+}
+
+struct Keyboard {
+    path: PathBuf,
+    dev: Device,
+}
+
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+const POLL_INTERVAL: Duration = Duration::from_millis(8);
+const OWN_DEVICE_NAME: &str = "dictationapp virtual keyboard";
+
+impl Watcher {
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        Self {
+            stop: Arc::new(StopSignal::default()),
+            worker: None,
+            generation: NEXT_GENERATION
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |next| {
+                    next.checked_add(1)
+                })
+                .expect("test watcher generation fits"),
+        }
+    }
+
+    pub fn start(key: KeyCode, mode: Mode, tx: Sender<Command>) -> Result<Watcher> {
+        let generation = NEXT_GENERATION
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| anyhow::anyhow!("hotkey watcher generation exhausted"))?;
+        let stop = Arc::new(StopSignal::default());
+        let mut devices = Devices {
+            keyboards: Vec::new(),
+            key,
+            mode,
+            tx,
+            hold: Hold::new(),
+            failed: HashSet::new(),
+            generation,
+        };
+        devices.scan()?;
+        eprintln!(
+            "hotkey: {key:?} ({mode:?}) on {} device(s)",
+            devices.keyboards.len()
+        );
+        let worker_stop = Arc::clone(&stop);
+        let worker = thread::Builder::new()
+            .name("dictation-hotkey".into())
+            .spawn(move || devices.watch(worker_stop))
+            .context("unable to start hotkey watcher")?;
+        Ok(Watcher {
+            stop,
+            worker: Some(worker),
+            generation,
+        })
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Quiescent on success. The caller handles active capture and queued events
+    /// from this generation before starting a replacement.
+    pub fn stop(&mut self) -> Result<()> {
+        self.stop.stop();
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("hotkey watcher panicked"))?;
+        }
         Ok(())
     }
 }
 
 impl Drop for Watcher {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        if let Err(error) = self.stop() {
+            eprintln!("hotkey shutdown failed: {error:#}");
+        }
     }
 }
 
-/// Open every /dev/input/event* that isn't already watched and spawn a
-/// listener for each keyboard found. Devices that can't be opened yet — e.g.
-/// udev hasn't applied the user ACL on a fresh node — are retried on the next
-/// scan; `failed` keeps that log from repeating every interval. Non-keyboards
-/// are re-probed each scan so a node re-created at the same path is classified
-/// fresh.
-fn scan_devices(
+fn send_hotkey(tx: &Sender<Command>, generation: u64, action: Option<HotkeyCommand>) -> Result<()> {
+    if let Some(action) = action {
+        tx.send(Command::Hotkey { generation, action })
+            .context("dictation command receiver closed")?;
+    }
+    Ok(())
+}
+
+fn is_own_device(name: Option<&str>) -> bool {
+    name == Some(OWN_DEVICE_NAME)
+}
+
+fn seed_modifiers(
+    hold: &mut Hold,
+    path: &Path,
+    keys: &evdev::AttributeSetRef<KeyCode>,
     key: KeyCode,
     mode: Mode,
-    tx: &Sender<Command>,
-    watched: &Arc<Mutex<HashSet<PathBuf>>>,
-    hold: &Arc<Mutex<Hold>>,
-    failed: &mut HashSet<PathBuf>,
-    stop: &Arc<AtomicBool>,
-) {
-    let Ok(entries) = std::fs::read_dir("/dev/input") else {
-        return;
-    };
-    for path in entries.flatten().map(|e| e.path()) {
-        let is_event_node = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("event"));
-        if !is_event_node || watched.lock().unwrap().contains(&path) {
-            continue;
-        }
-        let dev = match Device::open(&path) {
-            Ok(d) => d,
-            Err(e) => {
-                if failed.insert(path.clone()) {
-                    eprintln!("hotkey: {} unreadable ({e}); will retry", path.display());
-                }
-                continue;
-            }
-        };
-        failed.remove(&path);
-        if !is_keyboard(&dev) {
-            continue;
-        }
-        watched.lock().unwrap().insert(path.clone());
-        let tx = tx.clone();
-        let stop = stop.clone();
-        let watched = Arc::clone(watched);
-        let hold = Arc::clone(hold);
-        // Poll with a timeout so the stop flag is honored quickly.
-        dev.set_nonblocking(true).ok();
-        thread::spawn(move || {
-            watch_device(&path, dev, key, mode, tx, &hold, stop);
-            watched.lock().unwrap().remove(&path);
-        });
+) -> Option<HotkeyCommand> {
+    for modifier in keys
+        .iter()
+        .filter(|code| *code != key && is_modifier(*code))
+    {
+        hold.modifiers.insert((path.to_path_buf(), modifier));
+    }
+    if hold.modifiers.is_empty() {
+        None
+    } else {
+        hold.chord(mode)
     }
 }
 
-fn watch_device(
-    path: &Path,
-    mut dev: Device,
+struct Devices {
+    keyboards: Vec<Keyboard>,
     key: KeyCode,
     mode: Mode,
     tx: Sender<Command>,
-    hold: &Mutex<Hold>,
-    stop: Arc<AtomicBool>,
-) {
-    let name = dev.name().unwrap_or("?").to_string();
-    // Send while holding the lock so commands keep the order of the
-    // transitions that produced them across device threads.
-    let apply = |input| {
-        let mut hold = hold.lock().unwrap();
-        if let Some(cmd) = hold.apply(path, input, mode, Instant::now()) {
-            let _ = tx.send(cmd);
-        }
-    };
-    eprintln!("hotkey: watching {} ({})", path.display(), name);
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            return;
-        }
-        match dev.fetch_events() {
-            Ok(events) => {
-                for input in events.filter_map(|ev| classify(&ev, key)) {
-                    apply(input);
+    hold: Hold,
+    failed: HashSet<PathBuf>,
+    generation: u64,
+}
+
+impl Devices {
+    fn scan(&mut self) -> Result<()> {
+        let entries = std::fs::read_dir("/dev/input").context("unable to enumerate /dev/input")?;
+        let mut paths = entries
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()
+            .context("unable to enumerate input device nodes")?;
+        paths.sort();
+        self.failed.retain(|path| paths.contains(path));
+        for path in paths {
+            let is_event_node = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("event"));
+            if !is_event_node || self.keyboards.iter().any(|keyboard| keyboard.path == path) {
+                continue;
+            }
+            let open = || -> Result<Option<(Device, evdev::AttributeSet<KeyCode>)>> {
+                let dev = Device::open(&path)?;
+                // Old installations may still expose their uinput keyboard. New
+                // delivery uses the Wayland protocol and has no evdev device at all.
+                if is_own_device(dev.name()) || !is_keyboard(&dev) {
+                    return Ok(None);
+                }
+                dev.set_nonblocking(true)
+                    .context("unable to make input reads nonblocking")?;
+                let held = dev
+                    .get_key_state()
+                    .context("unable to read initial keyboard state")?;
+                Ok(Some((dev, held)))
+            };
+            match open() {
+                Ok(Some((dev, held))) => {
+                    self.failed.remove(&path);
+                    send_hotkey(
+                        &self.tx,
+                        self.generation,
+                        seed_modifiers(&mut self.hold, &path, &held, self.key, self.mode),
+                    )?;
+                    eprintln!(
+                        "hotkey: watching {} ({})",
+                        path.display(),
+                        dev.name().unwrap_or("?")
+                    );
+                    self.keyboards.push(Keyboard { path, dev });
+                }
+                Ok(None) => {
+                    self.failed.remove(&path);
+                }
+                Err(error) => {
+                    if self.failed.insert(path.clone()) {
+                        eprintln!(
+                            "hotkey: {} unavailable ({error:#}); will retry",
+                            path.display()
+                        );
+                    }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(8));
+        }
+        Ok(())
+    }
+    fn watch(mut self, stop: Arc<StopSignal>) {
+        let mut last_scan = Instant::now();
+        while !stop.is_stopped() {
+            if last_scan.elapsed() >= RESCAN_INTERVAL {
+                if let Err(error) = self.scan() {
+                    eprintln!("hotkey rescan failed: {error:#}; will retry");
+                }
+                last_scan = Instant::now();
             }
-            Err(e) => {
-                // Device removed or unplugged — stop watching it.
-                eprintln!("hotkey: {} ({}) unreadable: {e}", path.display(), name);
-                apply(Input::Lost);
-                return;
+            let mut inputs = Vec::new();
+            let mut lost = Vec::new();
+            for keyboard in &mut self.keyboards {
+                match keyboard.dev.fetch_events() {
+                    Ok(events) => {
+                        for event in events {
+                            if let Some(input) = classify(&event, self.key) {
+                                // Kernel timestamps preserve the actual gesture
+                                // duration even when both events arrive in one batch.
+                                inputs.push((event.timestamp(), keyboard.path.clone(), input));
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => {
+                        eprintln!("hotkey: {} unreadable: {error}", keyboard.path.display());
+                        lost.push(keyboard.path.clone());
+                    }
+                }
             }
+            inputs.sort_by_key(|(at, _, _)| *at);
+            for (at, path, input) in inputs {
+                if stop.is_stopped()
+                    || send_hotkey(
+                        &self.tx,
+                        self.generation,
+                        self.hold.apply(&path, input, self.mode, at),
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            for path in lost {
+                self.keyboards.retain(|keyboard| keyboard.path != path);
+                if stop.is_stopped()
+                    || send_hotkey(
+                        &self.tx,
+                        self.generation,
+                        self.hold
+                            .apply(&path, Input::Lost, self.mode, SystemTime::now()),
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            stop.wait(POLL_INTERVAL);
         }
     }
 }
@@ -329,7 +477,7 @@ fn watch_device(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::typer::Typer;
+    use crate::typer::VirtualKeyboard;
     use std::sync::mpsc::channel;
 
     /// A quick tap on the virtual uinput keyboard must reach the listener as a
@@ -338,8 +486,9 @@ mod tests {
     /// leaving a recording running until the next press.
     /// F24 is used so a running instance's configured hotkey can't fire.
     #[test]
+    #[ignore = "requires /dev/uinput; emits real keyboard events"]
     fn quick_tap_reaches_listener_as_start_and_cancel() {
-        let mut typer = Typer::new().expect("uinput must be writable");
+        let mut typer = VirtualKeyboard::new().expect("uinput must be writable");
         thread::sleep(Duration::from_millis(500));
 
         let (tx, rx) = channel();
@@ -349,11 +498,17 @@ mod tests {
         thread::sleep(Duration::from_millis(10));
         typer.emit(KeyCode::KEY_F24, 0).unwrap();
 
-        for expected in [Command::Start, Command::Cancel] {
+        for expected in [HotkeyCommand::Start, HotkeyCommand::Cancel] {
             let cmd = rx
                 .recv_timeout(Duration::from_secs(3))
                 .unwrap_or_else(|e| panic!("expected {expected:?}: {e}"));
-            assert_eq!(cmd, expected);
+            assert_eq!(
+                cmd,
+                Command::Hotkey {
+                    generation: watcher.generation(),
+                    action: expected
+                }
+            );
         }
         drop(watcher);
     }
@@ -362,12 +517,13 @@ mod tests {
     /// must be picked up by the rescan. Regresses the one-shot-enumeration bug
     /// where a re-enumerated keyboard left the hotkey dead until app restart.
     #[test]
+    #[ignore = "requires /dev/uinput; emits real keyboard events"]
     fn hotplugged_keyboard_is_watched() {
         let (tx, rx) = channel();
         let watcher = Watcher::start(KeyCode::KEY_F24, Mode::Toggle, tx).expect("enumerate");
 
         // The "keyboard" only shows up now — after the watcher started.
-        let mut typer = Typer::new().expect("uinput must be writable");
+        let mut typer = VirtualKeyboard::new().expect("uinput must be writable");
 
         // Re-emit until a rescan attaches a listener (or the deadline fails).
         let deadline = Instant::now() + Duration::from_secs(6);
@@ -377,7 +533,13 @@ mod tests {
             typer.emit(KeyCode::KEY_F24, 0).unwrap();
             match rx.recv_timeout(Duration::from_millis(400)) {
                 Ok(cmd) => {
-                    assert_eq!(cmd, Command::Toggle);
+                    assert_eq!(
+                        cmd,
+                        Command::Hotkey {
+                            generation: watcher.generation(),
+                            action: HotkeyCommand::Toggle
+                        }
+                    );
                     break;
                 }
                 Err(_) if Instant::now() < deadline => continue,
@@ -388,9 +550,9 @@ mod tests {
     }
 
     /// Feed `(device, input, ms since the first input)` through one Hold.
-    fn run(mode: Mode, inputs: &[(&str, Input, u64)]) -> Vec<Command> {
+    fn run(mode: Mode, inputs: &[(&str, Input, u64)]) -> Vec<HotkeyCommand> {
         let mut hold = Hold::new();
-        let t0 = Instant::now();
+        let t0 = SystemTime::UNIX_EPOCH;
         inputs
             .iter()
             .filter_map(|&(dev, input, ms)| {
@@ -403,6 +565,87 @@ mod tests {
     const OTHER: &str = "/dev/input/event2";
 
     #[test]
+    fn initial_modifiers_block_shortcuts_but_hotkey_alone_does_not() {
+        let mut keys = evdev::AttributeSet::new();
+        keys.insert(KeyCode::KEY_RIGHTCTRL);
+        let mut hold = Hold::new();
+        let path = Path::new(KBD);
+        let now = SystemTime::UNIX_EPOCH;
+        assert_eq!(
+            seed_modifiers(&mut hold, path, &keys, KeyCode::KEY_RIGHTCTRL, Mode::Hold),
+            None
+        );
+        assert_eq!(
+            hold.apply(path, Input::HotkeyDown, Mode::Hold, now),
+            Some(HotkeyCommand::Start)
+        );
+        keys.insert(KeyCode::KEY_LEFTSHIFT);
+        assert_eq!(
+            seed_modifiers(&mut hold, path, &keys, KeyCode::KEY_RIGHTCTRL, Mode::Hold),
+            Some(HotkeyCommand::Cancel)
+        );
+        assert_eq!(
+            hold.apply(
+                path,
+                Input::HotkeyUp,
+                Mode::Hold,
+                now + Duration::from_secs(1)
+            ),
+            None
+        );
+        assert_eq!(
+            hold.apply(
+                path,
+                Input::HotkeyDown,
+                Mode::Hold,
+                now + Duration::from_secs(2)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn clock_rollback_discards_the_recording() {
+        let mut hold = Hold::new();
+        let path = Path::new(KBD);
+        assert_eq!(
+            hold.apply(
+                path,
+                Input::HotkeyDown,
+                Mode::Hold,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(2)
+            ),
+            Some(HotkeyCommand::Start)
+        );
+        assert_eq!(
+            hold.apply(
+                path,
+                Input::HotkeyUp,
+                Mode::Hold,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1)
+            ),
+            Some(HotkeyCommand::Cancel)
+        );
+    }
+
+    #[test]
+    fn stop_wakes_and_joins_the_worker() {
+        let mut watcher = Watcher::for_test();
+        let stop = Arc::clone(&watcher.stop);
+        let (ready_tx, ready_rx) = channel();
+        let (done_tx, done_rx) = channel();
+        watcher.worker = Some(thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            stop.wait(Duration::from_secs(86_400));
+            done_tx.send(()).unwrap();
+        }));
+        ready_rx.recv().unwrap();
+        watcher.stop().unwrap();
+        assert_eq!(done_rx.try_recv(), Ok(()));
+        watcher.stop().unwrap();
+    }
+
+    #[test]
     fn hold_shorter_than_min_hold_is_a_tap() {
         let hold = |ms| {
             run(
@@ -410,8 +653,8 @@ mod tests {
                 &[(KBD, Input::HotkeyDown, 0), (KBD, Input::HotkeyUp, ms)],
             )
         };
-        assert_eq!(hold(249), [Command::Start, Command::Cancel]);
-        assert_eq!(hold(250), [Command::Start, Command::Stop]);
+        assert_eq!(hold(249), [HotkeyCommand::Start, HotkeyCommand::Cancel]);
+        assert_eq!(hold(250), [HotkeyCommand::Start, HotkeyCommand::Stop]);
     }
 
     #[test]
@@ -425,7 +668,7 @@ mod tests {
                 (KBD, Input::HotkeyUp, 600),
             ],
         );
-        assert_eq!(cmds, [Command::Start, Command::Cancel]);
+        assert_eq!(cmds, [HotkeyCommand::Start, HotkeyCommand::Cancel]);
     }
 
     #[test]
@@ -442,10 +685,10 @@ mod tests {
             (KBD, Input::HotkeyDown, 800),
             (KBD, Input::HotkeyUp, 900),
         ];
-        assert_eq!(run(Mode::Toggle, &ctrl_tap), [Command::Toggle]);
+        assert_eq!(run(Mode::Toggle, &ctrl_tap), [HotkeyCommand::Toggle]);
         assert_eq!(
             run(Mode::Hold, &ctrl_tap),
-            [Command::Start, Command::Cancel]
+            [HotkeyCommand::Start, HotkeyCommand::Cancel]
         );
         // A modifier held on a vanished device no longer counts.
         let lost = [
@@ -454,14 +697,17 @@ mod tests {
             (OTHER, Input::HotkeyDown, 20),
             (OTHER, Input::HotkeyUp, 100),
         ];
-        assert_eq!(run(Mode::Toggle, &lost), [Command::Toggle]);
+        assert_eq!(run(Mode::Toggle, &lost), [HotkeyCommand::Toggle]);
         // A letter still down from typing doesn't block dictation.
         let rollover = [
             (KBD, Input::OtherKey, 0),
             (KBD, Input::HotkeyDown, 30),
             (KBD, Input::HotkeyUp, 400),
         ];
-        assert_eq!(run(Mode::Hold, &rollover), [Command::Start, Command::Stop]);
+        assert_eq!(
+            run(Mode::Hold, &rollover),
+            [HotkeyCommand::Start, HotkeyCommand::Stop]
+        );
     }
 
     #[test]
@@ -473,7 +719,7 @@ mod tests {
         ];
         assert_eq!(run(Mode::Toggle, &chord), []);
         let tap = [(KBD, Input::HotkeyDown, 0), (KBD, Input::HotkeyUp, 50)];
-        assert_eq!(run(Mode::Toggle, &tap), [Command::Toggle]);
+        assert_eq!(run(Mode::Toggle, &tap), [HotkeyCommand::Toggle]);
     }
 
     #[test]
@@ -487,7 +733,7 @@ mod tests {
                 (OTHER, Input::HotkeyUp, 105),
             ],
         );
-        assert_eq!(cmds, [Command::Toggle]);
+        assert_eq!(cmds, [HotkeyCommand::Toggle]);
     }
 
     #[test]
@@ -496,7 +742,7 @@ mod tests {
             Mode::Hold,
             &[(KBD, Input::HotkeyDown, 0), (KBD, Input::Lost, 900)],
         );
-        assert_eq!(cmds, [Command::Start, Command::Cancel]);
+        assert_eq!(cmds, [HotkeyCommand::Start, HotkeyCommand::Cancel]);
         // A release from a hold this listener never saw does nothing.
         assert_eq!(run(Mode::Hold, &[(KBD, Input::HotkeyUp, 0)]), []);
     }

@@ -17,6 +17,7 @@ depends=(
   'libxkbcommon-x11'
   'wayland'
   'fontconfig'
+  'wtype'
 )
 makedepends=('cargo' 'pkgconf')
 optdepends=(

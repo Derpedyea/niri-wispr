@@ -53,6 +53,17 @@ pub struct SettingsView {
     message: Option<(String, bool)>, // (text, is_error)
 }
 
+fn delete_previous_word(value: &mut String) {
+    let cut = value
+        .trim_end()
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace() || matches!(ch, '/' | '_' | '-'))
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    value.truncate(cut);
+}
+
 /// Open the settings window. `tx` lets Save notify the pill to reload config.
 pub fn open<V: 'static + Render>(cx: &mut Context<V>, tx: Sender<Command>) {
     let dims = gpui::size(px(460.0), px(760.0));
@@ -180,13 +191,7 @@ impl SettingsView {
         if ks.key == "backspace" {
             if ks.modifiers.control {
                 // ctrl+backspace: delete to previous word boundary
-                let v = self.field_mut(field);
-                let trimmed = v.trim_end();
-                let cut = trimmed
-                    .rfind(|c: char| c.is_whitespace() || c == '/' || c == '_' || c == '-')
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-                v.truncate(cut);
+                delete_previous_word(self.field_mut(field));
             } else {
                 self.field_mut(field).pop();
             }
@@ -195,10 +200,11 @@ impl SettingsView {
                 let clean: String = text.chars().filter(|c| !c.is_control()).collect();
                 self.field_mut(field).push_str(clean.trim());
             }
-        } else if let Some(ch) = &ks.key_char {
-            if !ks.modifiers.control && !ks.modifiers.platform {
-                self.field_mut(field).push_str(ch);
-            }
+        } else if let Some(ch) = &ks.key_char
+            && !ks.modifiers.control
+            && !ks.modifiers.platform
+        {
+            self.field_mut(field).push_str(ch);
         }
         cx.notify();
     }
@@ -479,10 +485,10 @@ impl SettingsView {
     fn scroll_content(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         // Keep a configured-but-currently-unplugged device selectable.
         let mut mic_names = self.mic_devices.clone();
-        if let Some(m) = &self.mic {
-            if !mic_names.contains(m) {
-                mic_names.push(m.clone());
-            }
+        if let Some(m) = &self.mic
+            && !mic_names.contains(m)
+        {
+            mic_names.push(m.clone());
         }
         div()
             .id("settings-scroll")
@@ -711,5 +717,27 @@ impl Render for SettingsView {
             .flex_col()
             .child(self.scroll_content(cx))
             .child(self.footer(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::delete_previous_word;
+
+    #[test]
+    fn ctrl_backspace_handles_unicode_word_boundaries() {
+        for (before, after) in [
+            ("foo\u{2003}bar", "foo\u{2003}"),
+            ("foo\u{a0}bar  ", "foo\u{a0}"),
+            ("中文\u{3000}🙂", "中文\u{3000}"),
+            ("provider/model", "provider/"),
+            ("KEY_RIGHTCTRL", "KEY_"),
+            ("🙂", ""),
+            ("   ", ""),
+        ] {
+            let mut value = before.to_string();
+            delete_previous_word(&mut value);
+            assert_eq!(value, after, "input: {before:?}");
+        }
     }
 }

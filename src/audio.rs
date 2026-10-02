@@ -3,7 +3,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// State shared between the audio capture callback and the UI.
 pub struct Capture {
@@ -11,11 +11,35 @@ pub struct Capture {
     pub samples: Mutex<Vec<f32>>,
     /// Latest RMS level (f32 bits), for the level meter.
     pub level: AtomicU32,
+    /// A stream error permanently invalidates this recording, even if capture resumes.
+    failure: OnceLock<String>,
 }
 
 impl Capture {
     pub fn level(&self) -> f32 {
         f32::from_bits(self.level.load(Ordering::Relaxed))
+    }
+
+    /// Read without clearing the error so the UI and finish-time check both see it.
+    pub fn failure(&self) -> Option<String> {
+        self.failure.get().cloned()
+    }
+
+    fn fail(&self, error: String) {
+        self.failure.get_or_init(|| error);
+        self.level.store(0, Ordering::Relaxed);
+    }
+
+    /// Called only after the stream has stopped and its callbacks have joined.
+    fn take_samples(&self) -> Result<Vec<f32>> {
+        if let Some(error) = self.failure() {
+            return Err(anyhow!("audio capture failed: {error}"));
+        }
+        let mut samples = self
+            .samples
+            .lock()
+            .map_err(|_| anyhow!("audio capture samples were poisoned"))?;
+        Ok(std::mem::take(&mut *samples))
     }
 }
 
@@ -28,11 +52,11 @@ pub struct Recording {
 
 impl Recording {
     /// Stop capturing and return (mono samples, sample_rate).
-    pub fn finish(self) -> (Vec<f32>, u32) {
+    pub fn finish(self) -> Result<(Vec<f32>, u32)> {
         let stream = self.stream;
         drop(stream);
-        let mut samples = self.capture.samples.lock().unwrap();
-        (std::mem::take(&mut *samples), self.sample_rate)
+        // A callback may fail while the stream is shutting down. Check afterwards.
+        Ok((self.capture.take_samples()?, self.sample_rate))
     }
 }
 
@@ -45,13 +69,20 @@ where
     f32: FromSample<T>,
 {
     let channels = config.channels as usize;
+    let error_capture = capture.clone();
     let stream = device
         .build_input_stream::<T, _, _>(
             config,
             move |data: &[T], _| {
+                if capture.failure.get().is_some() {
+                    return;
+                }
                 let mut sum_sq = 0.0f32;
                 let mut frames = 0usize;
-                let mut out = capture.samples.lock().unwrap();
+                let Ok(mut out) = capture.samples.lock() else {
+                    capture.fail("audio capture samples were poisoned".into());
+                    return;
+                };
                 for frame in data.chunks(channels) {
                     let mono: f32 =
                         frame.iter().map(|s| s.to_sample::<f32>()).sum::<f32>() / channels as f32;
@@ -68,6 +99,7 @@ where
             },
             move |err| {
                 eprintln!("audio stream error: {err}");
+                error_capture.fail(err.to_string());
             },
             None,
         )
@@ -95,10 +127,10 @@ pub fn input_device_names() -> Vec<String> {
         if d.default_input_config().is_err() {
             continue;
         }
-        if let Some(name) = device_name(&d) {
-            if seen.insert(name.clone()) {
-                names.push(name);
-            }
+        if let Some(name) = device_name(&d)
+            && seen.insert(name.clone())
+        {
+            names.push(name);
         }
     }
     names
@@ -160,6 +192,7 @@ pub fn start(mic: Option<&str>) -> Result<Recording> {
             sample_rate as usize * 30, // ~30s of mono audio
         )),
         level: AtomicU32::new(0),
+        failure: OnceLock::new(),
     });
 
     let stream = match supported.sample_format() {
@@ -186,22 +219,6 @@ pub fn start(mic: Option<&str>) -> Result<Recording> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    #[ignore] // needs real audio hardware — run with --ignored
-    fn lists_and_opens_input_devices() {
-        let names = super::input_device_names();
-        for n in &names {
-            eprintln!("input device: {n}");
-        }
-        assert!(!names.is_empty(), "no input devices on this system");
-        for n in &names {
-            assert!(super::start(Some(n)).is_ok(), "failed to open device {n:?}");
-        }
-    }
-}
-
 /// Encode mono f32 samples as 16-bit PCM WAV bytes.
 pub fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
     let spec = hound::WavSpec {
@@ -224,4 +241,60 @@ pub fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
         writer.finalize().context("failed to finalize wav")?;
     }
     Ok(cursor.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn capture(samples: Vec<f32>) -> Capture {
+        Capture {
+            samples: Mutex::new(samples),
+            level: AtomicU32::new(0),
+            failure: OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn failed_capture_never_returns_a_partial_recording() {
+        let capture = capture(vec![0.1; 100]);
+        assert!(capture.failure().is_none());
+        capture.fail("microphone disconnected".into());
+        assert_eq!(
+            capture.failure().as_deref(),
+            Some("microphone disconnected")
+        );
+        assert!(capture.take_samples().is_err());
+        assert!(capture.take_samples().is_err());
+        // A later callback cannot hide the first failure or mark the prefix complete.
+        capture.fail("later error".into());
+        assert_eq!(
+            capture.failure().as_deref(),
+            Some("microphone disconnected")
+        );
+    }
+
+    #[test]
+    fn a_new_capture_after_failure_can_complete() {
+        let failed = capture(vec![0.1]);
+        failed.fail("disconnected".into());
+        drop(failed);
+
+        let retry = capture(vec![0.2, -0.2]);
+        assert_eq!(retry.take_samples().unwrap(), vec![0.2, -0.2]);
+        assert!(retry.samples.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    #[ignore] // needs real audio hardware — run with --ignored
+    fn lists_and_opens_input_devices() {
+        let names = super::input_device_names();
+        for n in &names {
+            eprintln!("input device: {n}");
+        }
+        assert!(!names.is_empty(), "no input devices on this system");
+        for n in &names {
+            assert!(super::start(Some(n)).is_ok(), "failed to open device {n:?}");
+        }
+    }
 }
