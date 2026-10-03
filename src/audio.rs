@@ -30,6 +30,20 @@ impl Capture {
         self.level.store(0, Ordering::Relaxed);
     }
 
+    /// cpal keeps streaming after an overrun or a reroute, so those cost a few
+    /// milliseconds of audio, not the recording. Everything else fails closed.
+    fn stream_error(&self, error: cpal::Error) {
+        eprintln!("audio stream error: {error}");
+        if !matches!(
+            error.kind(),
+            cpal::ErrorKind::Xrun
+                | cpal::ErrorKind::DeviceChanged
+                | cpal::ErrorKind::RealtimeDenied
+        ) {
+            self.fail(error.to_string());
+        }
+    }
+
     /// Called only after the stream has stopped and its callbacks have joined.
     fn take_samples(&self) -> Result<Vec<f32>> {
         if let Some(error) = self.failure() {
@@ -97,10 +111,7 @@ where
                     capture.level.store(boosted.to_bits(), Ordering::Relaxed);
                 }
             },
-            move |err| {
-                eprintln!("audio stream error: {err}");
-                error_capture.fail(err.to_string());
-            },
+            move |err| error_capture.stream_error(err),
             None,
         )
         .context("failed to build input stream")?;
@@ -272,6 +283,20 @@ mod tests {
             capture.failure().as_deref(),
             Some("microphone disconnected")
         );
+    }
+
+    #[test]
+    fn only_stream_errors_that_stop_capture_fail_it() {
+        let capture = capture(vec![0.1]);
+        for kind in [cpal::ErrorKind::Xrun, cpal::ErrorKind::DeviceChanged] {
+            capture.stream_error(cpal::Error::with_message(kind, "glitch"));
+        }
+        assert!(capture.failure().is_none());
+        capture.stream_error(cpal::Error::with_message(
+            cpal::ErrorKind::DeviceNotAvailable,
+            "unplugged",
+        ));
+        assert!(capture.take_samples().is_err());
     }
 
     #[test]
