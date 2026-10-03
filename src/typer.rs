@@ -3,16 +3,15 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
-use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_keyboard::KeymapFormat;
-use wayland_client::protocol::wl_registry::WlRegistry;
+use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::{
-    Connection, Dispatch, EventQueue, QueueHandle, backend::WaylandError, delegate_noop,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle, backend::WaylandError, delegate_noop,
 };
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
@@ -59,7 +58,7 @@ impl Typer {
     /// Fails when the compositor lacks the virtual keyboard protocol, so the
     /// app reports clipboard-only up front instead of on every dictation.
     pub fn new() -> Result<Typer> {
-        Session::connect()?;
+        Session::connect()?.link.settle()?;
         Ok(Typer { _private: () })
     }
 
@@ -83,17 +82,23 @@ impl Typer {
                 session.tap(key)?;
                 unsettled += 1;
                 if unsettled == BATCH {
-                    session.settle()?;
+                    session.link.settle()?;
                     unsettled = 0;
                 }
                 thread::sleep(KEY_INTERVAL);
             }
         }
-        session.settle()?;
+        session.link.settle()?;
         ensure!(!cancelled.load(Ordering::SeqCst), "typing cancelled");
         Ok(())
     }
 }
+
+/// smithay (niri) skips a keymap whose compiled text matches the one it last
+/// made active, even for windows opened since, which still hold the seat
+/// keymap and would read our keys as US letters. A name unique to each keymap
+/// survives compilation and keeps every upload distinct.
+static KEYMAP_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 /// One keymap and the keys typed with it.
 struct Chunk {
@@ -158,12 +163,17 @@ impl Chunk {
                 xkb::keysym_get_name(*keysym)
             )?;
         }
+        let name = format!(
+            "dictationapp-{}-{}",
+            std::process::id(),
+            KEYMAP_SERIAL.fetch_add(1, Ordering::Relaxed)
+        );
         let keymap = format!(
             "xkb_keymap {{\n\
-             xkb_keycodes \"dictationapp\" {{\nminimum = 8;\nmaximum = 255;\n{codes}}};\n\
-             xkb_types \"dictationapp\" {{ include \"complete\" }};\n\
-             xkb_compatibility \"dictationapp\" {{ include \"complete\" }};\n\
-             xkb_symbols \"dictationapp\" {{\n{syms}}};\n\
+             xkb_keycodes \"{name}\" {{\nminimum = 8;\nmaximum = 255;\n{codes}}};\n\
+             xkb_types \"{name}\" {{ include \"complete\" }};\n\
+             xkb_compatibility \"{name}\" {{ include \"complete\" }};\n\
+             xkb_symbols \"{name}\" {{\n{syms}}};\n\
              }};\n"
         );
         verify(&keymap, &all)?;
@@ -196,17 +206,25 @@ fn verify(keymap: &str, symbols: &[(u32, xkb::Keysym)]) -> Result<()> {
 #[derive(Default)]
 struct Events {
     settled: bool,
+    /// Globals the compositor advertised: (name, interface).
+    globals: Vec<(u32, String)>,
 }
 
-impl Dispatch<WlRegistry, GlobalListContents> for Events {
+impl Dispatch<WlRegistry, ()> for Events {
     fn event(
-        _: &mut Self,
+        events: &mut Self,
         _: &WlRegistry,
-        _: wayland_client::protocol::wl_registry::Event,
-        _: &GlobalListContents,
+        event: wl_registry::Event,
+        _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        if let wl_registry::Event::Global {
+            name, interface, ..
+        } = event
+        {
+            events.globals.push((name, interface));
+        }
     }
 }
 
@@ -229,56 +247,15 @@ delegate_noop!(Events: ignore WlSeat);
 delegate_noop!(Events: ZwpVirtualKeyboardManagerV1);
 delegate_noop!(Events: ZwpVirtualKeyboardV1);
 
-struct Session {
+/// Every wait on the compositor is bounded, so a hung compositor fails the
+/// transcript (clipboard fallback) instead of hanging the typing thread.
+struct Link {
     connection: Connection,
     queue: EventQueue<Events>,
     events: Events,
-    keyboard: ZwpVirtualKeyboardV1,
-    started: Instant,
 }
 
-impl Session {
-    fn connect() -> Result<Self> {
-        let connection = Connection::connect_to_env().context("no Wayland session to type into")?;
-        let (globals, queue) =
-            registry_queue_init::<Events>(&connection).context("unable to list Wayland globals")?;
-        let handle = queue.handle();
-        let seat: WlSeat = globals
-            .bind(&handle, 1..=1, ())
-            .context("compositor has no seat to type into")?;
-        let manager: ZwpVirtualKeyboardManagerV1 = globals
-            .bind(&handle, 1..=1, ())
-            .context("compositor lacks the Wayland virtual keyboard protocol")?;
-        let keyboard = manager.create_virtual_keyboard(&seat, &handle, ());
-        Ok(Self {
-            connection,
-            queue,
-            events: Events::default(),
-            keyboard,
-            started: Instant::now(),
-        })
-    }
-
-    fn keymap(&mut self, keymap: &str) -> Result<()> {
-        let mut file = tempfile::tempfile().context("unable to create typing keymap")?;
-        // NUL-terminated, like every wl_keyboard keymap.
-        file.write_all(keymap.as_bytes())
-            .and_then(|()| file.write_all(&[0]))
-            .context("unable to write typing keymap")?;
-        let size = u32::try_from(keymap.len() + 1).context("typing keymap is too large")?;
-        self.keyboard
-            .keymap(KeymapFormat::XkbV1.into(), file.as_fd(), size);
-        Ok(())
-    }
-
-    fn tap(&mut self, key: u32) -> Result<()> {
-        let time = u32::try_from(self.started.elapsed().as_millis())
-            .context("typing session ran too long")?;
-        self.keyboard.key(time, key, 1);
-        self.keyboard.key(time, key, 0);
-        self.flush(Instant::now() + RESPONSE_TIMEOUT)
-    }
-
+impl Link {
     /// Waits until the compositor has handled every request sent so far.
     fn settle(&mut self) -> Result<()> {
         let deadline = Instant::now() + RESPONSE_TIMEOUT;
@@ -314,6 +291,66 @@ impl Session {
                 Err(error) => return Err(error).context("Wayland connection failed while typing"),
             }
         }
+    }
+}
+
+struct Session {
+    link: Link,
+    keyboard: ZwpVirtualKeyboardV1,
+    started: Instant,
+}
+
+impl Session {
+    fn connect() -> Result<Self> {
+        let connection = Connection::connect_to_env().context("no Wayland session to type into")?;
+        let mut link = Link {
+            queue: connection.new_event_queue(),
+            connection,
+            events: Events::default(),
+        };
+        let handle = link.queue.handle();
+        let registry = link.connection.display().get_registry(&handle, ());
+        // The compositor announces every global before answering the sync.
+        link.settle()?;
+        let global = |interface: &str| {
+            link.events
+                .globals
+                .iter()
+                .find(|(_, name)| name == interface)
+                .map(|&(id, _)| id)
+        };
+        let seat =
+            global(WlSeat::interface().name).context("compositor has no seat to type into")?;
+        let manager = global(ZwpVirtualKeyboardManagerV1::interface().name)
+            .context("compositor lacks the Wayland virtual keyboard protocol")?;
+        let seat: WlSeat = registry.bind(seat, 1, &handle, ());
+        let manager: ZwpVirtualKeyboardManagerV1 = registry.bind(manager, 1, &handle, ());
+        let keyboard = manager.create_virtual_keyboard(&seat, &handle, ());
+        Ok(Self {
+            link,
+            keyboard,
+            started: Instant::now(),
+        })
+    }
+
+    fn keymap(&mut self, keymap: &str) -> Result<()> {
+        let mut file = tempfile::tempfile().context("unable to create typing keymap")?;
+        // NUL-terminated, like every wl_keyboard keymap.
+        file.write_all(keymap.as_bytes())
+            .and_then(|()| file.write_all(&[0]))
+            .context("unable to write typing keymap")?;
+        let size = u32::try_from(keymap.len() + 1).context("typing keymap is too large")?;
+        self.keyboard
+            .keymap(KeymapFormat::XkbV1.into(), file.as_fd(), size);
+        Ok(())
+    }
+
+    fn tap(&mut self, key: u32) -> Result<()> {
+        let time = u32::try_from(self.started.elapsed().as_millis())
+            .context("typing session ran too long")?;
+        self.keyboard.key(time, key, 1);
+        self.keyboard.key(time, key, 0);
+        self.link.flush(Instant::now() + RESPONSE_TIMEOUT)
     }
 }
 
@@ -418,6 +455,23 @@ mod tests {
             );
         }
         assert_eq!(typed(&chunks), text);
+    }
+
+    #[test]
+    fn identical_transcripts_compile_to_distinct_keymaps() {
+        let compiled = |text| {
+            let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+            xkb::Keymap::new_from_string(
+                &context,
+                plan(text).unwrap().remove(0).keymap,
+                xkb::KEYMAP_FORMAT_TEXT_V1,
+                xkb::KEYMAP_COMPILE_NO_FLAGS,
+            )
+            .unwrap()
+            .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
+        };
+        // smithay compares these compiled strings, not what we upload.
+        assert_ne!(compiled("Okay."), compiled("Okay."));
     }
 
     #[test]
