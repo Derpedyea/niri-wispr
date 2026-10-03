@@ -84,9 +84,10 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
   pressing the key; letters/Space are rejected), mode, mic, API key, model presets + Custom,
   language, cleanup, typing, sounds. Every change saves at once and sends `Command::Reload`;
   there is no Save button. Edits file values only (`Config::load_file`), so an
-  `OPENROUTER_API_KEY` is shown read-only and never written into the file. Rereads the file
-  whenever the window is focused or reopened, so outside edits aren't overwritten; an
-  unreadable file pauses saving. One window: a second open focuses it via
+  `OPENROUTER_API_KEY` is shown read-only and never written into the file. Rereads the file and
+  re-lists mics whenever the window is focused or reopened (the one window is reused), so
+  outside edits aren't overwritten and new mics appear; an unreadable file pauses saving.
+  `focus_field` is the only way to focus a text field and ends any pending key capture. One window: a second open focuses it via
   `niri msg action focus-window`.
 - `tray.rs` — StatusNotifierItem via `ksni` (blocking API on the async-io zbus already in the
   tree). Symbolic mic icon, which Noctalia tints to its bar color; while a cued recording

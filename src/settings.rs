@@ -63,6 +63,8 @@ pub struct SettingsView {
     env_key: bool,
     custom_model: bool,
     mics: audio::InputDevices,
+    /// Lists input devices; `audio::input_devices` outside tests.
+    list_mics: Box<dyn Fn() -> audio::InputDevices>,
     reveal_key: bool,
     active: Option<Field>,
     capture: Option<Capture>,
@@ -94,7 +96,7 @@ pub fn open<V: 'static>(cx: &mut Context<V>, tx: Sender<Command>) -> Result<()> 
     if let Some(&OpenSettings(handle)) = cx.try_global::<OpenSettings>()
         && handle
             .update(cx, |view, window, cx| {
-                view.reread_file();
+                view.refresh();
                 cx.notify();
                 window.activate_window();
             })
@@ -123,7 +125,7 @@ pub fn open<V: 'static>(cx: &mut Context<V>, tx: Sender<Command>) -> Result<()> 
             ..Default::default()
         },
         move |window, cx| {
-            let view = cx.new(|cx| SettingsView::new(config, tx, window, cx));
+            let view = cx.new(|cx| SettingsView::new(config, tx, audio::input_devices, window, cx));
             window.set_window_title("Dictation Settings");
             window.focus(&view.read(cx).focus_handle);
             view
@@ -135,13 +137,19 @@ pub fn open<V: 'static>(cx: &mut Context<V>, tx: Sender<Command>) -> Result<()> 
 }
 
 impl SettingsView {
-    fn new(cfg: Config, tx: Sender<Command>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // Coming back picks up edits made elsewhere meanwhile. Leaving
+    fn new(
+        cfg: Config,
+        tx: Sender<Command>,
+        list_mics: impl Fn() -> audio::InputDevices + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // Coming back picks up what changed elsewhere meanwhile. Leaving
         // abandons a pending capture, so the next key typed elsewhere can't
         // become the hotkey.
         let activation = cx.observe_window_activation(window, |view, window, cx| {
             if window.is_window_active() {
-                view.reread_file();
+                view.refresh();
                 cx.notify();
             } else {
                 view.cancel_capture(cx);
@@ -152,7 +160,8 @@ impl SettingsView {
             tx,
             env_key: std::env::var("OPENROUTER_API_KEY").is_ok_and(|k| !k.trim().is_empty()),
             custom_model: !MODELS.iter().any(|(_, slug)| *slug == cfg.model),
-            mics: audio::input_devices(),
+            mics: list_mics(),
+            list_mics: Box::new(list_mics),
             cfg,
             reveal_key: false,
             active: None,
@@ -164,9 +173,12 @@ impl SettingsView {
         }
     }
 
-    /// Re-read config.toml, so edits made outside this window (an editor and
-    /// `--reload`) aren't overwritten by the next change here.
-    fn reread_file(&mut self) {
+    /// Catch up with what changed outside this window — config.toml edits (an
+    /// editor and `--reload`), which the next change here would otherwise
+    /// overwrite, and microphones plugged in or out — since one window is
+    /// reused rather than reopened.
+    fn refresh(&mut self) {
+        self.mics = (self.list_mics)();
         match self.cfg.reread() {
             Ok(cfg) => {
                 self.custom_model = !MODELS.iter().any(|(_, slug)| *slug == cfg.model);
@@ -259,7 +271,9 @@ impl SettingsView {
                 Some(i) => (i + 1) % order.len(),
                 None => 0,
             };
-            self.active = order.get(next).copied();
+            if let Some(&field) = order.get(next) {
+                self.focus_field(field, cx);
+            }
             cx.notify();
             return;
         }
@@ -352,6 +366,13 @@ impl SettingsView {
         };
         cx.notify();
         false
+    }
+
+    /// Focus a text field. A pending key capture ends first, or it would take
+    /// the keys typed into the field.
+    fn focus_field(&mut self, field: Field, cx: &mut Context<Self>) {
+        self.cancel_capture(cx);
+        self.active = Some(field);
     }
 
     fn cancel_capture(&mut self, cx: &mut Context<Self>) {
@@ -642,10 +663,7 @@ impl SettingsView {
             .cursor_text()
             .on_mouse_down(
                 MouseButton::Left,
-                on_press(cx, move |view, _, cx| {
-                    view.active = Some(f);
-                    view.cancel_capture(cx);
-                }),
+                on_press(cx, move |view, _, cx| view.focus_field(f, cx)),
             )
             .child(
                 div()
@@ -905,9 +923,9 @@ impl SettingsView {
         model_options.push((
             "Custom".into(),
             self.custom_model,
-            Box::new(|v: &mut Self, _: &mut Window, _: &mut Context<Self>| {
+            Box::new(|v: &mut Self, _: &mut Window, cx: &mut Context<Self>| {
                 v.custom_model = true;
-                v.active = Some(Field::Model);
+                v.focus_field(Field::Model, cx);
             }),
         ));
         let model_row = div()
@@ -1076,6 +1094,13 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::mpsc::channel;
 
+    fn no_mics() -> audio::InputDevices {
+        audio::InputDevices {
+            all: Vec::new(),
+            cards: Vec::new(),
+        }
+    }
+
     fn config_at(path: PathBuf) -> Config {
         Config {
             api_key: None,
@@ -1132,15 +1157,23 @@ mod tests {
     }
 
     /// Edits made elsewhere while Settings sits open survive the next change
-    /// here; a file that stops parsing is left alone rather than replaced.
+    /// here, and mics plugged in meanwhile show up; a file that stops parsing
+    /// is left alone rather than replaced.
     #[gpui::test]
     fn coming_back_picks_up_outside_edits(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config_at(dir.path().join("config.toml"));
         cfg.save().unwrap();
         let (tx, _reloads) = channel();
-        let (view, cx) =
-            cx.add_window_view(|window, cx| SettingsView::new(cfg.clone(), tx, window, cx));
+        let plugged = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let mics = plugged.clone();
+        let list_mics = move || audio::InputDevices {
+            all: mics.borrow().clone(),
+            cards: mics.borrow().clone(),
+        };
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            SettingsView::new(cfg.clone(), tx, list_mics, window, cx)
+        });
         let come_back = |cx: &mut VisualTestContext| {
             cx.update(|window, _| window.activate_window());
             cx.run_until_parked();
@@ -1154,7 +1187,11 @@ mod tests {
         }
         .save()
         .unwrap();
+        plugged
+            .borrow_mut()
+            .push("USB Microphone, USB Audio".into());
         come_back(cx);
+        assert!(view.read_with(cx, |view, _| view.mics.cards.len() == 1));
         view.update(cx, |view, _| view.set_flag(Flag::Beeps));
         let saved = cfg.reread().unwrap();
         assert_eq!((saved.model.as_str(), saved.beeps), ("custom/model", false));
@@ -1175,7 +1212,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         let cfg = config_at(path.clone());
         let (tx, reloads) = channel();
-        let window = cx.add_window(|window, cx| SettingsView::new(cfg, tx, window, cx));
+        let window = cx.add_window(|window, cx| SettingsView::new(cfg, tx, no_mics, window, cx));
         // Poll once with `key` pressed (or none) after `waited`.
         let poll = |cx: &mut TestAppContext, key: Option<KeyCode>, waited: Duration| {
             let (press, key_capture) = hotkey::KeyCapture::detached();
@@ -1209,6 +1246,18 @@ mod tests {
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(saved.contains(r#"hotkey = "KEY_F13""#), "{saved}");
         assert_eq!(reloads.try_recv(), Ok(Command::Reload));
+
+        // Focusing a field ends a capture, so it can't eat what's typed there.
+        window
+            .update(cx, |view, _, cx| {
+                view.capture = Some(Capture {
+                    key: hotkey::KeyCapture::detached().1,
+                    started: Instant::now(),
+                });
+                view.focus_field(Field::Model, cx);
+                assert!(view.capture.is_none() && view.active == Some(Field::Model));
+            })
+            .unwrap();
     }
 
     #[test]
