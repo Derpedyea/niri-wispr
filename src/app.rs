@@ -266,11 +266,15 @@ impl DictationView {
         if restart_hotkey {
             // Quiesce the old producer before cancelling its capture. The new
             // generation filters its queued commands without discarding IPC.
+            // With no watcher, no gesture is in flight: keep IPC recordings.
             let stopped = match self.watcher.take() {
-                Some(mut watcher) => watcher.stop(),
+                Some(mut watcher) => {
+                    let stopped = watcher.stop();
+                    self.cancel_recording();
+                    stopped
+                }
                 None => Ok(()),
             };
-            self.cancel_recording();
             let mode = if new.mode == "toggle" {
                 hotkey::Mode::Toggle
             } else {
@@ -582,13 +586,23 @@ impl DictationView {
 
     fn prepare_delivery(&mut self, text: &str, cx: &mut Context<Self>) -> Option<Delivery> {
         // Save may have queued Reload while the periodic pump is still waiting
-        // for its next tick. Apply it before choosing clipboard-only vs typing.
-        self.drain_commands(cx);
+        // for its next tick. Apply it before choosing clipboard-only vs typing;
+        // anything else runs once delivery has begun, as on that next tick.
+        let (settings, later): (Vec<_>, Vec<_>) = self
+            .rx
+            .try_iter()
+            .partition(|command| matches!(command, Command::Reload | Command::Quit));
+        for command in settings {
+            self.handle_command(command, cx);
+        }
         if self.shutting_down {
             return None;
         }
         cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
         let delivery = self.begin_delivery();
+        for command in later {
+            self.handle_command(command, cx);
+        }
         cx.notify();
         delivery
     }
@@ -981,12 +995,19 @@ mod tests {
         view.update(cx, |view, _| {
             view.watcher = None;
             view.config.hotkey = "INVALID_TEST_KEY".into();
+            // Started over IPC; no hotkey gesture can be in flight.
+            view.status = Status::Recording {
+                started: Instant::now(),
+                cued: true,
+            };
             view.apply_config_with(
                 config(false),
                 || panic!("disabled output created a typer"),
                 watcher,
             );
             assert!(view.watcher.is_some());
+            assert!(matches!(view.status, Status::Recording { .. }));
+            view.status = Status::Idle;
 
             let mut invalid = config(false);
             invalid.hotkey = "INVALID_TEST_KEY".into();
@@ -1003,6 +1024,18 @@ mod tests {
                 watcher,
             );
             assert!(view.watcher.is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn start_queued_as_a_transcript_lands_is_not_dropped(cx: &mut TestAppContext) {
+        let view = view(cx, false);
+        view.update(cx, |view, cx| {
+            view.status = Status::Transcribing;
+            view.tx.send(Command::Start).unwrap();
+            assert!(view.prepare_delivery("done", cx).is_none());
+            // No API key in tests, so a handled Start reaches StartFailed.
+            assert!(matches!(view.status, Status::StartFailed { .. }));
         });
     }
 
