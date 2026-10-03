@@ -169,6 +169,14 @@ impl Hold {
         }
     }
 
+    /// A keyboard grabbed by a remapper (keyd, kanata) still reports its key
+    /// state but sends us no events, so a modifier it no longer reports as held
+    /// would otherwise never see its release and block every later dictation.
+    fn sync_modifiers(&mut self, dev: &Path, held: &evdev::AttributeSetRef<KeyCode>) {
+        self.modifiers
+            .retain(|(path, code)| path != dev || held.contains(*code));
+    }
+
     /// A key pressed during the hold makes it a shortcut.
     fn chord(&mut self, mode: Mode) -> Option<HotkeyCommand> {
         if self.down.is_empty() || self.chorded {
@@ -268,7 +276,11 @@ impl Watcher {
             failed: HashSet::new(),
             generation,
         };
-        devices.scan()?;
+        // The worker rescans every second, so a /dev/input that is missing or
+        // unreadable at startup is picked up once it appears.
+        if let Err(error) = devices.scan() {
+            eprintln!("hotkey scan failed: {error:#}; will retry");
+        }
         eprintln!(
             "hotkey: {key:?} ({mode:?}) on {} device(s)",
             devices.keyboards.len()
@@ -378,6 +390,12 @@ impl Devices {
             .context("unable to enumerate input device nodes")?;
         paths.sort();
         self.failed.retain(|path| paths.contains(path));
+        for keyboard in &self.keyboards {
+            // Unreadable state means the device is going away; Lost clears it.
+            if let Ok(held) = keyboard.dev.get_key_state() {
+                self.hold.sync_modifiers(&keyboard.path, &held);
+            }
+        }
         for path in paths {
             let is_event_node = path
                 .file_name()
@@ -617,6 +635,27 @@ mod tests {
                 now + Duration::from_secs(2)
             ),
             None
+        );
+    }
+
+    #[test]
+    fn modifiers_a_device_stops_reporting_no_longer_block_dictation() {
+        let mut held = evdev::AttributeSet::new();
+        held.insert(KeyCode::KEY_LEFTMETA);
+        let mut hold = Hold::new();
+        let path = Path::new(KBD);
+        let now = SystemTime::UNIX_EPOCH;
+        seed_modifiers(&mut hold, path, &held, KeyCode::KEY_RIGHTCTRL, Mode::Hold);
+        // Still held: the next press is a shortcut.
+        hold.sync_modifiers(path, &held);
+        assert_eq!(hold.apply(path, Input::HotkeyDown, Mode::Hold, now), None);
+        hold.apply(path, Input::HotkeyUp, Mode::Hold, now);
+        // Released while the device sent no events (grabbed by a remapper).
+        hold.sync_modifiers(Path::new(OTHER), &evdev::AttributeSet::new());
+        hold.sync_modifiers(path, &evdev::AttributeSet::new());
+        assert_eq!(
+            hold.apply(path, Input::HotkeyDown, Mode::Hold, now),
+            Some(HotkeyCommand::Start)
         );
     }
 
