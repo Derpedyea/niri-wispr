@@ -55,9 +55,8 @@ spawn-at-startup "~/.cargo/bin/dictationapp"
 - **An OpenRouter API key** — set it in the settings window, in
   `config.toml`, or via `OPENROUTER_API_KEY`
 - **Read access to `/dev/input/event*`** — for the global hotkey
-- **[`wtype`](https://github.com/atx/wtype)** and a compositor supporting the
-  Wayland virtual keyboard protocol — for Unicode text insertion. AUR installs
-  wtype automatically; source and tarball installs need it separately.
+- **A compositor supporting the Wayland virtual keyboard protocol** (niri,
+  sway, Hyprland, …) — for Unicode text insertion
 - **`pw-play`, `paplay`, or `aplay`** — for the start/stop cues (any one of
   them; `beeps = false` silences this entirely)
 - A microphone reachable through cpal's default input device
@@ -169,10 +168,9 @@ binds {
 
 ## Troubleshooting
 
-- **Nothing types** — install `wtype` and check that your compositor supports
-  its virtual keyboard protocol. Transcripts still reach the clipboard;
-  `type_text = false` silences the startup warning. Reload settings after
-  installing wtype to enable typing without restarting.
+- **Nothing types** — check that your compositor supports the Wayland
+  virtual keyboard protocol. Transcripts still reach the clipboard;
+  `type_text = false` silences the startup warning.
 - **Hotkey does nothing** — check read access to `/dev/input/event*`. IPC
   (`--toggle`, clicking a visible pill) works regardless. The watcher picks
   up newly connected devices within about a second.
@@ -248,7 +246,7 @@ and [docs/window-lifecycle.md](docs/window-lifecycle.md) for native verification
 | `audio.rs` | mic capture + WAV encode |
 | `api.rs` | OpenRouter transcription + cleanup pass |
 | `hotkey.rs` | evdev global hotkey watcher |
-| `typer.rs` | Unicode Wayland insertion via wtype; cancelled children are killed/reaped |
+| `typer.rs` | Unicode insertion through a Wayland virtual keyboard |
 | `ipc.rs` | Ordered CLI commands, acknowledgements, and lifetime-held instance lock |
 | `settings.rs` | settings window |
 | `beep.rs` | audio cues |

@@ -56,9 +56,12 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
   key during the hold→Cancel (it's a shortcut like RightCtrl+C); a Ctrl/Shift/Alt/Super already
   held at press makes it a shortcut too (Ctrl+C with hotkey C). Toggle mode: release of a
   lone tap→Toggle. No time debounce — one dropped a quick tap's release and left recordings running.
-- `typer.rs` — wtype's Unicode Wayland virtual keyboard, independent of physical
-  layout/CapsLock and invisible to evdev. Anonymous input files, cancellation,
-  timeout, parent-death guard, and kill/reap retries own every child exit.
+- `typer.rs` — in-process Wayland virtual keyboard (`zwp_virtual_keyboard_v1`) with
+  per-transcript keymaps: independent of physical layout/CapsLock and invisible to evdev.
+  Text only borrows printable keycodes — Chromium/Electron/terminals act on Backspace,
+  Escape, F-keys etc. by scancode whatever the keysym (why not wtype: atx/wtype#71).
+  Keys are paced: niri disconnects a client whose socket fills. Verify against a real
+  client with `scripts/check-typing.py` (headless niri + Chrome).
 - `beep.rs` — start/stop/error audio cues; WAVs generated once into `dirs::cache_dir()/dictationapp`,
   played via pw-play/paplay/aplay. `beeps = false` in config disables.
 - `niri.rs` — moves the pill to bottom-center of the **focused** output via `niri msg`
@@ -98,9 +101,11 @@ toggles caused invisible recordings). Re-add a `spawn ".../dictationapp" "--togg
 - Hotkey events pass through to the focused app too (no device grab — grabbing would block
   normal typing). RightCtrl is inert in practice.
 - If several devices report the same key, overlapping holds count as one gesture.
-- `/dev/input/event*` needs read access (user ACL); typing needs `wtype` and the
-  Wayland virtual keyboard protocol. Missing wtype degrades to clipboard-only;
-  install it and reload to retry. `/dev/uinput` is only used by opt-in hardware tests.
+- `/dev/input/event*` needs read access (user ACL); typing needs the compositor's
+  Wayland virtual keyboard protocol, else clipboard-only. `/dev/uinput` is only used
+  by opt-in hardware tests.
+- Chromium truncates keysyms past U+FFFF, so typed emoji arrive mangled there
+  (any keyboard-based typer does this); the clipboard copy is exact.
 - Never leave an alpha-zero idle toplevel mapped: it blocks underlying buttons and steals
   focus on niri, even with an empty Wayland input region. Idle must mean no pill window.
 - GPUI 0.2.2 normally exits when its last Linux window closes. `vendor/gpui` adds an opt-out;

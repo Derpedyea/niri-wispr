@@ -859,8 +859,8 @@ mod tests {
     }
 
     fn typer() -> Typer {
-        // Delivery preparation never executes this path; child I/O is tested in typer.rs.
-        Typer::for_test(PathBuf::from("/unused-test-wtype"))
+        // Delivery preparation never connects; typing is tested in typer.rs.
+        Typer::for_test()
     }
 
     fn watcher(_: evdev::KeyCode, _: hotkey::Mode, _: Sender<Command>) -> anyhow::Result<Watcher> {
@@ -914,11 +914,15 @@ mod tests {
     fn unavailable_delivery_fails_closed_and_can_retry(cx: &mut TestAppContext) {
         let view = view(cx, false);
         view.update(cx, |view, _| {
-            view.apply_config_with(config(true), || anyhow::bail!("missing wtype"), watcher);
+            view.apply_config_with(
+                config(true),
+                || anyhow::bail!("no virtual keyboard"),
+                watcher,
+            );
             assert!(
                 view.error
                     .as_ref()
-                    .is_some_and(|message| message.contains("missing wtype"))
+                    .is_some_and(|message| message.contains("no virtual keyboard"))
             );
             assert!(view.begin_delivery().is_none());
             view.apply_config_with(config(true), || Ok(typer()), watcher);

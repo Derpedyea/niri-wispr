@@ -1454,6 +1454,9 @@ dependencies = [
  "tempfile",
  "toml 1.1.6+spec-1.1.0",
  "ureq",
+ "wayland-client",
+ "wayland-protocols-misc",
+ "xkbcommon",
 ]
 
 [[package]]
@@ -6687,6 +6690,19 @@ dependencies = [
  "bitflags 2.13.2",
  "wayland-backend",
  "wayland-client",
+ "wayland-scanner",
+]
+
+[[package]]
+name = "wayland-protocols-misc"
+version = "0.3.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e9567599ef23e09b8dad6e429e5738d4509dfc46b3b21f32841a304d16b29c8"
+dependencies = [
+ "bitflags 2.13.2",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols 0.32.13",
  "wayland-scanner",
 ]
 

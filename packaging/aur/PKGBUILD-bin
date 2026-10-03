@@ -19,7 +19,6 @@ depends=(
   'libxkbcommon-x11'
   'wayland'
   'fontconfig'
-  'wtype'
 )
 optdepends=(
   'niri: positions the pill at the bottom-center of the output'
