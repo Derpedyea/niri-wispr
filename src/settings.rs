@@ -57,11 +57,13 @@ pub struct SettingsView {
 }
 
 fn delete_previous_word(value: &mut String) {
+    let is_break = |ch: char| ch.is_whitespace() || matches!(ch, '/' | '_' | '-');
+    // Trailing breaks go with the word, so repeated presses keep deleting.
     let cut = value
-        .trim_end()
+        .trim_end_matches(is_break)
         .char_indices()
         .rev()
-        .find(|(_, ch)| ch.is_whitespace() || matches!(ch, '/' | '_' | '-'))
+        .find(|&(_, ch)| is_break(ch))
         .map(|(index, ch)| index + ch.len_utf8())
         .unwrap_or(0);
     value.truncate(cut);
@@ -725,6 +727,8 @@ mod tests {
             ("foo\u{a0}bar  ", "foo\u{a0}"),
             ("中文\u{3000}🙂", "中文\u{3000}"),
             ("provider/model", "provider/"),
+            ("provider/", ""),
+            ("org/provider/", "org/"),
             ("KEY_RIGHTCTRL", "KEY_"),
             ("🙂", ""),
             ("   ", ""),
