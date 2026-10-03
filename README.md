@@ -230,6 +230,7 @@ release still happens.
 cargo build                    # debug binary at target/debug/dictationapp
 cargo test                     # deterministic tests; no desktop input
 cargo test -- --ignored        # opt-in hardware/input + network tests
+python3 scripts/test-aur-publish.py  # mocked publishing; no network or credentials
 ```
 
 Rust + [gpui](https://github.com/zed-industries/zed) (UI), cpal (audio),
