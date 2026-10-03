@@ -62,12 +62,15 @@ pub struct SettingsView {
     /// OPENROUTER_API_KEY overrides the file's key; shown read-only.
     env_key: bool,
     custom_model: bool,
-    mic_devices: Vec<String>,
+    mics: audio::InputDevices,
     reveal_key: bool,
     active: Option<Field>,
     capture: Option<Capture>,
     /// Why the last capture didn't change the key.
     capture_note: Option<&'static str>,
+    /// config.toml stopped reading: saving waits until it reads again rather
+    /// than replace it with values from before.
+    load_error: Option<String>,
     save_error: Option<String>,
     _activation: Subscription,
 }
@@ -90,7 +93,11 @@ fn delete_previous_word(value: &mut String) {
 pub fn open<V: 'static>(cx: &mut Context<V>, tx: Sender<Command>) -> Result<()> {
     if let Some(&OpenSettings(handle)) = cx.try_global::<OpenSettings>()
         && handle
-            .update(cx, |_, window, _| window.activate_window())
+            .update(cx, |view, window, cx| {
+                view.reread_file();
+                cx.notify();
+                window.activate_window();
+            })
             .is_ok()
     {
         niri::focus_settings();
@@ -129,10 +136,14 @@ pub fn open<V: 'static>(cx: &mut Context<V>, tx: Sender<Command>) -> Result<()> 
 
 impl SettingsView {
     fn new(cfg: Config, tx: Sender<Command>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // Leaving the window abandons a pending capture, so the next key
-        // typed elsewhere can't become the hotkey.
+        // Coming back picks up edits made elsewhere meanwhile. Leaving
+        // abandons a pending capture, so the next key typed elsewhere can't
+        // become the hotkey.
         let activation = cx.observe_window_activation(window, |view, window, cx| {
-            if !window.is_window_active() {
+            if window.is_window_active() {
+                view.reread_file();
+                cx.notify();
+            } else {
                 view.cancel_capture(cx);
             }
         });
@@ -141,19 +152,36 @@ impl SettingsView {
             tx,
             env_key: std::env::var("OPENROUTER_API_KEY").is_ok_and(|k| !k.trim().is_empty()),
             custom_model: !MODELS.iter().any(|(_, slug)| *slug == cfg.model),
-            mic_devices: audio::input_device_names(),
+            mics: audio::input_devices(),
             cfg,
             reveal_key: false,
             active: None,
             capture: None,
             capture_note: None,
+            load_error: None,
             save_error: None,
             _activation: activation,
         }
     }
 
+    /// Re-read config.toml, so edits made outside this window (an editor and
+    /// `--reload`) aren't overwritten by the next change here.
+    fn reread_file(&mut self) {
+        match self.cfg.reread() {
+            Ok(cfg) => {
+                self.custom_model = !MODELS.iter().any(|(_, slug)| *slug == cfg.model);
+                self.cfg = cfg;
+                self.load_error = None;
+            }
+            Err(e) => self.load_error = Some(format!("{e:#}")),
+        }
+    }
+
     /// Write config.toml and have the app reload it.
     fn persist(&mut self) {
+        if self.load_error.is_some() {
+            return;
+        }
         // Trim only what's written: the fields keep exactly what was typed.
         let trimmed = |v: &Option<String>| {
             v.as_deref()
@@ -487,6 +515,48 @@ fn radio(selected: bool) -> Div {
         })
 }
 
+struct MicRow {
+    value: Option<String>,
+    label: String,
+    detail: String,
+    selected: bool,
+}
+
+/// Picker rows: System default, each sound card, and the configured mic when
+/// it isn't one of them. The setting resolves the way recording does, so a
+/// substring like "USB" selects the device it actually opens.
+fn mic_rows(mic: Option<&str>, mics: &audio::InputDevices) -> Vec<MicRow> {
+    // (row name, whether a device by that name exists)
+    let chosen = mic.map(|m| match audio::match_mic(m, &mics.all) {
+        Some(index) => (mics.all[index].as_str(), true),
+        None => (m, false),
+    });
+    let mut names: Vec<&str> = mics.cards.iter().map(String::as_str).collect();
+    if let Some((name, _)) = chosen
+        && !names.contains(&name)
+    {
+        names.push(name);
+    }
+    let mut rows = vec![MicRow {
+        value: None,
+        label: "System default".into(),
+        detail: String::new(),
+        selected: chosen.is_none(),
+    }];
+    for name in names {
+        // ALSA names read "Card, Input": lead with the card.
+        let (card, input) = name.split_once(", ").unwrap_or((name, ""));
+        let missing = chosen == Some((name, false));
+        rows.push(MicRow {
+            value: Some(name.to_string()),
+            label: card.to_string(),
+            detail: if missing { "Not connected" } else { input }.to_string(),
+            selected: chosen.is_some_and(|(chosen, _)| chosen == name),
+        });
+    }
+    rows
+}
+
 fn segmented(
     id: &'static str,
     options: Vec<(SharedString, bool, Handler)>,
@@ -738,30 +808,16 @@ impl SettingsView {
     }
 
     fn mic_section(&self, cx: &mut Context<Self>) -> Div {
-        // Keep a configured-but-unplugged device visible and selected.
-        let mut names = self.mic_devices.clone();
-        if let Some(m) = &self.cfg.mic
-            && !names.contains(m)
-        {
-            names.push(m.clone());
-        }
-        let mut options: Vec<(Option<String>, String, String)> =
-            vec![(None, "System default".into(), String::new())];
-        for name in names {
-            // ALSA names read "Card, Input": lead with the card.
-            let (card, input) = name.split_once(", ").unwrap_or((name.as_str(), ""));
-            let detail = if self.mic_devices.contains(&name) {
-                input.to_string()
-            } else {
-                "Not connected".to_string()
-            };
-            options.push((Some(name.clone()), card.to_string(), detail));
-        }
-        let rows = options
+        let rows = mic_rows(self.cfg.mic.as_deref(), &self.mics)
             .into_iter()
             .enumerate()
-            .map(|(i, (value, label, detail))| {
-                let selected = self.cfg.mic == value;
+            .map(|(i, row)| {
+                let MicRow {
+                    value,
+                    label,
+                    detail,
+                    selected,
+                } = row;
                 div()
                     .id(SharedString::from(format!("mic-{i}")))
                     .flex()
@@ -953,9 +1009,15 @@ impl SettingsView {
             )
     }
 
-    /// A failed save, shown until the next one succeeds.
+    /// An unreadable config.toml or a failed save, until it's resolved.
     fn banner(&self) -> Option<Div> {
-        let text = self.save_error.clone()?;
+        let text = match (&self.load_error, &self.save_error) {
+            (Some(e), _) => format!(
+                "Can't read config.toml, so changes aren't saved. Fix it, then come back to this window.\n{e}"
+            ),
+            (None, Some(e)) => e.clone(),
+            (None, None) => return None,
+        };
         Some(
             div()
                 .px(px(12.0))
@@ -1010,16 +1072,12 @@ impl Render for SettingsView {
 mod tests {
     use super::*;
     use evdev::KeyCode;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, VisualTestContext};
+    use std::path::PathBuf;
     use std::sync::mpsc::channel;
 
-    /// A pressed key becomes the hotkey (saved and reloaded at once) unless it
-    /// types text; silence ends the wait.
-    #[gpui::test]
-    fn captured_key_is_saved_unless_it_types(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        let cfg = Config {
+    fn config_at(path: PathBuf) -> Config {
+        Config {
             api_key: None,
             model: crate::config::DEFAULT_MODEL.into(),
             language: None,
@@ -1030,8 +1088,92 @@ mod tests {
             beeps: true,
             cleanup: true,
             cleanup_model: crate::config::DEFAULT_CLEANUP_MODEL.into(),
-            path: path.clone(),
+            path,
+        }
+    }
+
+    #[test]
+    fn configured_mic_selects_the_device_recording_opens() {
+        let mics = audio::InputDevices {
+            all: [
+                "Default Audio Device",
+                "USB Microphone, USB Audio",
+                "PulseAudio Sound Server",
+            ]
+            .map(String::from)
+            .into(),
+            cards: vec!["USB Microphone, USB Audio".into()],
         };
+        let rows = |mic: Option<&str>| {
+            mic_rows(mic, &mics)
+                .into_iter()
+                .map(|row| (row.label, row.detail, row.selected))
+                .collect::<Vec<_>>()
+        };
+        let row = |label: &str, detail: &str, selected| (label.into(), detail.into(), selected);
+        // A substring picks the card it matches: no phantom "USB" row.
+        assert_eq!(
+            rows(Some("usb")),
+            [
+                row("System default", "", false),
+                row("USB Microphone", "USB Audio", true)
+            ]
+        );
+        // A sound-server device isn't a card but works: listed, not "Not connected".
+        assert_eq!(
+            rows(Some("pulse"))[2],
+            row("PulseAudio Sound Server", "", true)
+        );
+        assert_eq!(
+            rows(Some("Studio Mic"))[2],
+            row("Studio Mic", "Not connected", true)
+        );
+        assert!(rows(None)[0].2);
+    }
+
+    /// Edits made elsewhere while Settings sits open survive the next change
+    /// here; a file that stops parsing is left alone rather than replaced.
+    #[gpui::test]
+    fn coming_back_picks_up_outside_edits(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_at(dir.path().join("config.toml"));
+        cfg.save().unwrap();
+        let (tx, _reloads) = channel();
+        let (view, cx) =
+            cx.add_window_view(|window, cx| SettingsView::new(cfg.clone(), tx, window, cx));
+        let come_back = |cx: &mut VisualTestContext| {
+            cx.update(|window, _| window.activate_window());
+            cx.run_until_parked();
+        };
+        come_back(cx);
+
+        cx.deactivate_window();
+        Config {
+            model: "custom/model".into(),
+            ..cfg.clone()
+        }
+        .save()
+        .unwrap();
+        come_back(cx);
+        view.update(cx, |view, _| view.set_flag(Flag::Beeps));
+        let saved = cfg.reread().unwrap();
+        assert_eq!((saved.model.as_str(), saved.beeps), ("custom/model", false));
+
+        cx.deactivate_window();
+        std::fs::write(&cfg.path, "beeps = [").unwrap();
+        come_back(cx);
+        view.update(cx, |view, _| view.set_flag(Flag::Beeps));
+        assert_eq!(std::fs::read_to_string(&cfg.path).unwrap(), "beeps = [");
+        assert!(view.read_with(cx, |view, _| view.banner().is_some()));
+    }
+
+    /// A pressed key becomes the hotkey (saved and reloaded at once) unless it
+    /// types text; silence ends the wait.
+    #[gpui::test]
+    fn captured_key_is_saved_unless_it_types(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = config_at(path.clone());
         let (tx, reloads) = channel();
         let window = cx.add_window(|window, cx| SettingsView::new(cfg, tx, window, cx));
         // Poll once with `key` pressed (or none) after `waited`.

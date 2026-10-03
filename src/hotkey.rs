@@ -236,10 +236,28 @@ pub fn key_label(name: &str) -> String {
     named.to_string()
 }
 
-/// Keys used for ordinary typing — letters, digits, punctuation, Space,
-/// Enter, Tab, Backspace. As a hotkey, every one typed would open the mic.
+/// Keys that type text — letters, digits, punctuation, Space, Enter, Tab,
+/// Backspace, the keypad, and international layout keys. As a hotkey, every
+/// one typed would open the mic.
 pub fn is_typing_key(code: KeyCode) -> bool {
-    (KeyCode::KEY_1.code()..=KeyCode::KEY_SPACE.code()).contains(&code.code()) && !is_modifier(code)
+    let main_block = KeyCode::KEY_1.code()..=KeyCode::KEY_SPACE.code();
+    let keypad = KeyCode::KEY_KP7.code()..=KeyCode::KEY_KPDOT.code();
+    (main_block.contains(&code.code()) && !is_modifier(code))
+        || keypad.contains(&code.code())
+        || matches!(
+            code,
+            KeyCode::KEY_102ND
+                | KeyCode::KEY_RO
+                | KeyCode::KEY_YEN
+                | KeyCode::KEY_KPJPCOMMA
+                | KeyCode::KEY_KPENTER
+                | KeyCode::KEY_KPSLASH
+                | KeyCode::KEY_KPEQUAL
+                | KeyCode::KEY_KPPLUSMINUS
+                | KeyCode::KEY_KPCOMMA
+                | KeyCode::KEY_KPLEFTPAREN
+                | KeyCode::KEY_KPRIGHTPAREN
+        )
 }
 
 /// The pending Settings request for the next key press, by `KeyCapture` id.
@@ -248,8 +266,9 @@ pub fn is_typing_key(code: KeyCode) -> bool {
 static CAPTURE: Mutex<Option<(u64, Sender<KeyCode>)>> = Mutex::new(None);
 static NEXT_CAPTURE: AtomicU64 = AtomicU64::new(1);
 
-/// A request for the next key press (except Esc, which the Settings window
-/// handles itself). Dropping it withdraws the request.
+/// A request for the next key press. Esc isn't delivered — the Settings
+/// window turns it into a cancel — but while a request is pending it can't
+/// drive the hotkey either. Dropping the request withdraws it.
 pub struct KeyCapture {
     id: u64,
     rx: Receiver<KeyCode>,
@@ -287,19 +306,19 @@ impl Drop for KeyCapture {
     }
 }
 
-/// Hand a key press to a pending capture. False when none is pending or its
-/// receiver is gone, so the press drives the hotkey as usual.
-fn deliver_capture(ev: &InputEvent) -> bool {
+/// Whether a pending capture takes this key press, so it can't drive the
+/// hotkey: delivered to the capture, or Esc, which stays pending until the
+/// Settings window cancels it. False when no capture is waiting.
+fn claim_for_capture(ev: &InputEvent) -> bool {
     let code = KeyCode(ev.code());
-    if ev.event_type() != EventType::KEY
-        || ev.value() != 1
-        || is_button(code)
-        || code == KeyCode::KEY_ESC
-    {
+    if ev.event_type() != EventType::KEY || ev.value() != 1 || is_button(code) {
         return false;
     }
-    let pending = CAPTURE.lock().unwrap().take();
-    pending.is_some_and(|(_, tx)| tx.send(code).is_ok())
+    let mut pending = CAPTURE.lock().unwrap();
+    if code == KeyCode::KEY_ESC {
+        return pending.is_some();
+    }
+    pending.take().is_some_and(|(_, tx)| tx.send(code).is_ok())
 }
 
 fn is_keyboard(dev: &Device) -> bool {
@@ -573,7 +592,7 @@ impl Devices {
                 match keyboard.dev.fetch_events() {
                     Ok(events) => {
                         for event in events {
-                            let captured = deliver_capture(&event);
+                            let captured = claim_for_capture(&event);
                             if let Some(input) = classify(&event, self.key) {
                                 let input = match input {
                                     Input::HotkeyDown if captured => Input::CapturedHotkeyDown,
@@ -629,9 +648,10 @@ mod tests {
     use crate::typer::VirtualKeyboard;
     use std::sync::mpsc::channel;
 
-    /// Every watcher reads every virtual keyboard, so tests that press real
-    /// (uinput) keys take turns instead of reading each other's presses.
-    static UINPUT: Mutex<()> = Mutex::new(());
+    /// Every watcher reads every virtual keyboard and the capture request is
+    /// process-wide, so tests that press real (uinput) keys or capture take
+    /// turns instead of reading each other's presses.
+    static SERIAL: Mutex<()> = Mutex::new(());
 
     /// A quick tap on the virtual uinput keyboard must reach the listener as a
     /// full Start/Cancel pair — proves the whole hotkey path works on this
@@ -641,7 +661,7 @@ mod tests {
     #[test]
     #[ignore = "requires /dev/uinput; emits real keyboard events"]
     fn quick_tap_reaches_listener_as_start_and_cancel() {
-        let _serial = UINPUT.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut typer = VirtualKeyboard::new().expect("uinput must be writable");
         thread::sleep(Duration::from_millis(500));
 
@@ -673,7 +693,7 @@ mod tests {
     #[test]
     #[ignore = "requires /dev/uinput; emits real keyboard events"]
     fn hotplugged_keyboard_is_watched() {
-        let _serial = UINPUT.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let (tx, rx) = channel();
         let watcher = Watcher::start(KeyCode::KEY_F24, Mode::Toggle, tx).expect("enumerate");
 
@@ -709,7 +729,7 @@ mod tests {
     #[test]
     #[ignore = "requires /dev/uinput; emits real keyboard events"]
     fn captured_hotkey_press_is_not_dictation() {
-        let _serial = UINPUT.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut typer = VirtualKeyboard::new().expect("uinput must be writable");
         thread::sleep(Duration::from_millis(500));
         let (tx, rx) = channel();
@@ -740,6 +760,27 @@ mod tests {
     }
 
     #[test]
+    fn pending_capture_claims_presses_and_leaves_esc_to_settings() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let press = |key: KeyCode| InputEvent::new(EventType::KEY.0, key.code(), 1);
+        let release = |key: KeyCode| InputEvent::new(EventType::KEY.0, key.code(), 0);
+        assert!(!claim_for_capture(&press(KeyCode::KEY_ESC)));
+        // A withdrawn request claims nothing.
+        drop(KeyCapture::start());
+        assert!(!claim_for_capture(&press(KeyCode::KEY_F13)));
+
+        let capture = KeyCapture::start();
+        // Esc (say, the configured hotkey) is held back for Settings to cancel.
+        assert!(claim_for_capture(&press(KeyCode::KEY_ESC)));
+        assert_eq!(capture.try_recv(), Err(TryRecvError::Empty));
+        assert!(!claim_for_capture(&release(KeyCode::KEY_F13)));
+        assert!(claim_for_capture(&press(KeyCode::KEY_F13)));
+        assert_eq!(capture.try_recv(), Ok(KeyCode::KEY_F13));
+        // Spent: the next press drives the hotkey as usual.
+        assert!(!claim_for_capture(&press(KeyCode::KEY_ESC)));
+    }
+
+    #[test]
     fn captured_press_only_chords_a_hold_already_running() {
         let alone = [
             (KBD, Input::CapturedHotkeyDown, 0),
@@ -766,8 +807,25 @@ mod tests {
         assert_eq!(key_label("KEY_CAPSLOCK"), "Caps Lock");
         assert_eq!(key_label("KEY_F13"), "F13");
         assert_eq!(key_label("KEY_PAUSE"), "Pause");
-        assert!(is_typing_key(KeyCode::KEY_A) && is_typing_key(KeyCode::KEY_SPACE));
-        assert!(!is_typing_key(KeyCode::KEY_LEFTCTRL) && !is_typing_key(KeyCode::KEY_CAPSLOCK));
+        for typing in [
+            KeyCode::KEY_A,
+            KeyCode::KEY_SPACE,
+            KeyCode::KEY_KP1,
+            KeyCode::KEY_KPDOT,
+            KeyCode::KEY_KPENTER,
+            KeyCode::KEY_102ND,
+        ] {
+            assert!(is_typing_key(typing), "{typing:?}");
+        }
+        for hotkey in [
+            KeyCode::KEY_LEFTCTRL,
+            KeyCode::KEY_RIGHTCTRL,
+            KeyCode::KEY_CAPSLOCK,
+            KeyCode::KEY_NUMLOCK,
+            KeyCode::KEY_F13,
+        ] {
+            assert!(!is_typing_key(hotkey), "{hotkey:?}");
+        }
     }
 
     /// Feed `(device, input, ms since the first input)` through one Hold.

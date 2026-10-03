@@ -43,7 +43,8 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
   Active recording shows a 21-sample waveform from measured input levels. Window creation
   runs outside the view update because opening a GPUI window renders its root immediately.
 - `audio.rs` — cpal capture to mono f32 + hound WAV encode. `mic` config selects the input
-  device by name (exact, else case-insensitive substring; unset = system default).
+  device by name (exact, else case-insensitive substring; unset = system default) through
+  `match_mic`, which the settings picker shares so both agree on which device "USB" means.
   `input_device_names()` lists sound-card capture PCMs (`hw:`/`plughw:`/`front:`/`sysdefault:`)
   for the settings picker — not ALSA plugins — without test-opening them: a mic the
   sound server is briefly holding (right after a dictation) must not vanish from the list.
@@ -62,7 +63,8 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
   lone tap→Toggle. No time debounce — one dropped a quick tap's release and left recordings running.
   `KeyCapture` (Settings' "press a key") is answered by the watcher from the same event
   stream, and the captured press counts as a chord, so pressing the current hotkey there
-  never starts a dictation. Dropping the handle withdraws the request.
+  never starts a dictation. Esc stays pending for Settings to cancel, but can't drive the
+  hotkey while a capture waits. Dropping the handle withdraws the request.
 - `typer.rs` — in-process Wayland virtual keyboard (`zwp_virtual_keyboard_v1`) with
   per-transcript keymaps: independent of physical layout/CapsLock and invisible to evdev.
   Text only borrows printable keycodes — Chromium/Electron/terminals act on Backspace,
@@ -82,8 +84,10 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
   pressing the key; letters/Space are rejected), mode, mic, API key, model presets + Custom,
   language, cleanup, typing, sounds. Every change saves at once and sends `Command::Reload`;
   there is no Save button. Edits file values only (`Config::load_file`), so an
-  `OPENROUTER_API_KEY` is shown read-only and never written into the file. One window: a
-  second open focuses it via `niri msg action focus-window`.
+  `OPENROUTER_API_KEY` is shown read-only and never written into the file. Rereads the file
+  whenever the window is focused or reopened, so outside edits aren't overwritten; an
+  unreadable file pauses saving. One window: a second open focuses it via
+  `niri msg action focus-window`.
 - `tray.rs` — StatusNotifierItem via `ksni` (blocking API on the async-io zbus already in the
   tree). Symbolic mic icon, which Noctalia tints to its bar color; while a cued recording
   runs, status NeedsAttention + a procedurally drawn red-mic *pixmap* — Noctalia tints every
