@@ -104,7 +104,12 @@ fn send_to(path: &Path, cmd: Command) -> Result<()> {
     stream.set_write_timeout(Some(CLIENT_TIMEOUT))?;
     stream.write_all(command.as_bytes())?;
     stream.write_all(b"\n")?;
-    let reply = read_frame(&mut stream, CLIENT_TIMEOUT)?;
+    // An instance from before acknowledgements reads until EOF and never
+    // replies; ending the request makes it close now, not at our timeout.
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let reply = read_frame(&mut stream, CLIENT_TIMEOUT).context(
+        "dictationapp did not acknowledge the command; restart it if it was just upgraded",
+    )?;
     anyhow::ensure!(reply == b"ok", "dictationapp did not accept the command");
     Ok(())
 }
@@ -455,6 +460,22 @@ mod tests {
         }
         send_to(&dir.socket(), Command::Stop).unwrap();
         assert_eq!(rx.recv_timeout(CLIENT_TIMEOUT).unwrap(), Command::Stop);
+    }
+
+    #[test]
+    fn an_instance_without_acknowledgements_fails_without_waiting() {
+        let dir = TestDir::new();
+        let listener = UnixListener::bind(dir.socket()).unwrap();
+        // Before acknowledgements, the server read commands until EOF.
+        let old = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut commands = String::new();
+            stream.read_to_string(&mut commands).unwrap();
+            commands
+        });
+        let error = send_to(&dir.socket(), Command::Toggle).unwrap_err();
+        assert!(format!("{error:#}").contains("closed before"), "{error:#}");
+        assert_eq!(old.join().unwrap(), "toggle\n");
     }
 
     #[test]
