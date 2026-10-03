@@ -1,59 +1,75 @@
 //! Settings window — a second gpui window so config.toml never needs editing.
+//! Every change saves immediately and hot-reloads the running app.
 
 use crate::audio;
 use crate::config::Config;
 use crate::hotkey;
 use crate::ipc::Command;
+use crate::{niri, tray};
 use anyhow::{Context as _, Result};
 use gpui::{
-    App, Bounds, Context, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent,
-    SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb,
+    AnyElement, App, Bounds, Context, Div, FocusHandle, Focusable, FontWeight, Global,
+    KeyDownEvent, MouseButton, MouseDownEvent, SharedString, Stateful, Subscription,
+    TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions, div, prelude::*, px, rgb,
     rgba,
 };
-use std::path::PathBuf;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Sender, TryRecvError};
+use std::time::{Duration, Instant};
 
-const MODEL_PRESETS: &[&str] = &[
-    "fish-audio/transcribe-1",
-    "openai/whisper-large-v3",
-    "openai/whisper-1",
+/// Speech model presets as (label, OpenRouter slug); anything else is Custom.
+const MODELS: &[(&str, &str)] = &[
+    ("Fish Audio", "fish-audio/transcribe-1"),
+    ("Whisper v3", "openai/whisper-large-v3"),
+    ("Whisper", "openai/whisper-1"),
 ];
 
-const HOTKEY_PRESETS: &[&str] = &[
-    "KEY_RIGHTCTRL",
-    "KEY_LEFTCTRL",
-    "KEY_CAPSLOCK",
-    "KEY_SCROLLLOCK",
-    "KEY_F13",
-];
+/// How long "Press a key…" waits before giving up.
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
+
+const KEYS_URL: &str = "https://openrouter.ai/keys";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field {
     ApiKey,
     Model,
     Language,
-    Hotkey,
+}
+
+#[derive(Clone, Copy)]
+enum Flag {
+    TypeText,
+    Beeps,
+    Cleanup,
+}
+
+/// The open settings window, so the tray and `--settings` bring it forward
+/// instead of stacking duplicates.
+struct OpenSettings(WindowHandle<SettingsView>);
+impl Global for OpenSettings {}
+
+/// A pending "press a key" request; dropping it withdraws the request, so
+/// closing the window or clicking away can't leave the next key captured.
+struct Capture {
+    key: hotkey::KeyCapture,
+    started: Instant,
 }
 
 pub struct SettingsView {
     focus_handle: FocusHandle,
     tx: Sender<Command>,
-    config_path: PathBuf,
-    // Editable working copy of the config.
-    api_key: String,
-    model: String,
-    language: String,
-    mode_hold: bool,
-    hotkey: String,
-    mic: Option<String>,
+    /// The editable config — file values only (see `Config::load_file`).
+    cfg: Config,
+    /// OPENROUTER_API_KEY overrides the file's key; shown read-only.
+    env_key: bool,
+    custom_model: bool,
     mic_devices: Vec<String>,
-    type_text: bool,
-    beeps: bool,
-    cleanup: bool,
-    cleanup_model: String,
     reveal_key: bool,
     active: Option<Field>,
-    message: Option<(String, bool)>, // (text, is_error)
+    capture: Option<Capture>,
+    /// Why the last capture didn't change the key.
+    capture_note: Option<&'static str>,
+    save_error: Option<String>,
+    _activation: Subscription,
 }
 
 fn delete_previous_word(value: &mut String) {
@@ -69,14 +85,23 @@ fn delete_previous_word(value: &mut String) {
     value.truncate(cut);
 }
 
-/// Open the settings window. `tx` lets Save notify the pill to reload config.
-pub fn open<V: 'static + Render>(cx: &mut Context<V>, tx: Sender<Command>) -> Result<()> {
-    // Failed reads must not become an editable default that Save could persist.
-    let config = Config::load().context("unable to load settings")?;
+/// Open the settings window, or bring the open one forward. `tx` lets every
+/// change tell the running app to reload config.
+pub fn open<V: 'static>(cx: &mut Context<V>, tx: Sender<Command>) -> Result<()> {
+    if let Some(&OpenSettings(handle)) = cx.try_global::<OpenSettings>()
+        && handle
+            .update(cx, |_, window, _| window.activate_window())
+            .is_ok()
+    {
+        niri::focus_settings();
+        return Ok(());
+    }
+    // A failed read must not become an editable default that a save would
+    // persist. File values only: saving never copies OPENROUTER_API_KEY in.
+    let config = Config::load_file().context("unable to load settings")?;
     let dims = gpui::size(px(460.0), px(760.0));
     let bounds = Bounds::centered(None, dims, cx);
-    let tx2 = tx;
-    cx.open_window(
+    let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
@@ -91,223 +116,230 @@ pub fn open<V: 'static + Render>(cx: &mut Context<V>, tx: Sender<Command>) -> Re
             ..Default::default()
         },
         move |window, cx| {
-            let view = cx.new(|cx| SettingsView::new(config, tx2, cx));
+            let view = cx.new(|cx| SettingsView::new(config, tx, window, cx));
             window.set_window_title("Dictation Settings");
             window.focus(&view.read(cx).focus_handle);
             view
         },
-    )
-    .context("unable to open the settings window")?;
+    );
+    let handle = opened.context("unable to open the settings window")?;
+    cx.set_global(OpenSettings(handle));
     Ok(())
 }
 
 impl SettingsView {
-    fn new(cfg: Config, tx: Sender<Command>, cx: &mut Context<Self>) -> Self {
+    fn new(cfg: Config, tx: Sender<Command>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // Leaving the window abandons a pending capture, so the next key
+        // typed elsewhere can't become the hotkey.
+        let activation = cx.observe_window_activation(window, |view, window, cx| {
+            if !window.is_window_active() {
+                view.cancel_capture(cx);
+            }
+        });
         Self {
             focus_handle: cx.focus_handle(),
             tx,
-            config_path: cfg.path,
-            api_key: cfg.api_key.unwrap_or_default(),
-            model: cfg.model,
-            language: cfg.language.unwrap_or_default(),
-            mode_hold: cfg.mode != "toggle",
-            hotkey: cfg.hotkey,
-            mic: cfg.mic,
+            env_key: std::env::var("OPENROUTER_API_KEY").is_ok_and(|k| !k.trim().is_empty()),
+            custom_model: !MODELS.iter().any(|(_, slug)| *slug == cfg.model),
             mic_devices: audio::input_device_names(),
-            type_text: cfg.type_text,
-            beeps: cfg.beeps,
-            cleanup: cfg.cleanup,
-            cleanup_model: cfg.cleanup_model,
+            cfg,
             reveal_key: false,
             active: None,
-            message: None,
+            capture: None,
+            capture_note: None,
+            save_error: None,
+            _activation: activation,
         }
     }
 
-    fn field_mut(&mut self, f: Field) -> &mut String {
+    /// Write config.toml and have the app reload it.
+    fn persist(&mut self) {
+        // Trim only what's written: the fields keep exactly what was typed.
+        let trimmed = |v: &Option<String>| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(String::from)
+        };
+        let mut cfg = self.cfg.clone();
+        cfg.api_key = trimmed(&self.cfg.api_key);
+        cfg.language = trimmed(&self.cfg.language);
+        cfg.model = match self.cfg.model.trim() {
+            "" => crate::config::DEFAULT_MODEL.to_string(),
+            model => model.to_string(),
+        };
+        self.save_error = match cfg.save() {
+            Ok(()) => self
+                .tx
+                .send(Command::Reload)
+                .err()
+                .map(|e| format!("Saved, but the app didn't reload: {e}")),
+            Err(e) => Some(format!("Couldn't save: {e:#}")),
+        };
+    }
+
+    fn text(&self, f: Field) -> &str {
         match f {
-            Field::ApiKey => &mut self.api_key,
-            Field::Model => &mut self.model,
-            Field::Language => &mut self.language,
-            Field::Hotkey => &mut self.hotkey,
+            Field::ApiKey => self.cfg.api_key.as_deref().unwrap_or(""),
+            Field::Model => &self.cfg.model,
+            Field::Language => self.cfg.language.as_deref().unwrap_or(""),
         }
     }
 
-    fn field(&self, f: Field) -> &String {
+    fn edit(&mut self, f: Field, change: impl FnOnce(&mut String)) {
         match f {
-            Field::ApiKey => &self.api_key,
-            Field::Model => &self.model,
-            Field::Language => &self.language,
-            Field::Hotkey => &self.hotkey,
+            Field::ApiKey => change(self.cfg.api_key.get_or_insert_with(String::new)),
+            Field::Model => change(&mut self.cfg.model),
+            Field::Language => change(self.cfg.language.get_or_insert_with(String::new)),
         }
+        self.persist();
     }
 
-    fn activate(
-        f: Field,
-    ) -> impl Fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>) + 'static {
-        move |view, _, _, cx| {
-            view.active = Some(f);
-            cx.stop_propagation();
-            cx.notify();
+    /// Text fields reachable with Tab, in visual order.
+    fn fields(&self) -> Vec<Field> {
+        let mut order = Vec::new();
+        if !self.env_key {
+            order.push(Field::ApiKey);
         }
-    }
-
-    fn unfocus(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.active = None;
-        cx.notify();
+        if self.custom_model {
+            order.push(Field::Model);
+        }
+        order.push(Field::Language);
+        order
     }
 
     fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
-        match ks.key.as_str() {
-            "escape" => {
-                if self.active.is_some() {
-                    self.active = None;
-                    cx.notify();
-                } else {
-                    window.remove_window();
-                }
-                return;
+        if ks.key == "escape" {
+            if self.capture.is_some() {
+                self.cancel_capture(cx);
+            } else if self.active.is_some() {
+                self.active = None;
+            } else {
+                window.remove_window();
             }
-            "tab" => {
-                let order = [Field::ApiKey, Field::Model, Field::Language, Field::Hotkey];
-                self.active = Some(match self.active {
-                    None => order[0],
-                    Some(cur) => {
-                        let i = order.iter().position(|f| *f == cur).unwrap_or(0);
-                        order[(i + 1) % order.len()]
-                    }
-                });
-                cx.notify();
-                return;
-            }
-            _ => {}
+            cx.notify();
+            return;
+        }
+        // The watcher reads the captured key itself; don't also type it.
+        if self.capture.is_some() {
+            return;
+        }
+        if ks.key == "tab" {
+            let order = self.fields();
+            let next = match self.active.and_then(|f| order.iter().position(|o| *o == f)) {
+                Some(i) => (i + 1) % order.len(),
+                None => 0,
+            };
+            self.active = order.get(next).copied();
+            cx.notify();
+            return;
         }
         let Some(field) = self.active else { return };
-        if ks.key == "backspace" {
-            if ks.modifiers.control {
-                // ctrl+backspace: delete to previous word boundary
-                delete_previous_word(self.field_mut(field));
-            } else {
-                self.field_mut(field).pop();
-            }
+        if ks.key == "enter" {
+            self.active = None;
+        } else if ks.key == "backspace" {
+            let word = ks.modifiers.control;
+            self.edit(field, |v| {
+                if word {
+                    delete_previous_word(v);
+                } else {
+                    v.pop();
+                }
+            });
         } else if ks.modifiers.control && ks.key == "v" {
             if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
                 let clean: String = text.chars().filter(|c| !c.is_control()).collect();
-                self.field_mut(field).push_str(clean.trim());
+                self.edit(field, |v| v.push_str(clean.trim()));
             }
         } else if let Some(ch) = &ks.key_char
             && !ks.modifiers.control
             && !ks.modifiers.platform
         {
-            self.field_mut(field).push_str(ch);
+            self.edit(field, |v| v.push_str(ch));
         }
         cx.notify();
     }
 
-    fn pick_model(
-        m: &'static str,
-    ) -> impl Fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>) + 'static {
-        move |view, _, _, cx| {
-            view.model = m.to_string();
-            view.active = None;
-            cx.stop_propagation();
-            cx.notify();
-        }
+    fn unfocus(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.active = None;
+        self.cancel_capture(cx);
+        cx.notify();
     }
 
-    fn pick_hotkey(
-        k: &'static str,
-    ) -> impl Fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>) + 'static {
-        move |view, _, _, cx| {
-            view.hotkey = k.to_string();
-            cx.stop_propagation();
-            cx.notify();
-        }
-    }
-
-    fn pick_mic(
-        m: Option<String>,
-    ) -> impl Fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>) + 'static {
-        move |view, _, _, cx| {
-            view.mic = m.clone();
-            cx.stop_propagation();
-            cx.notify();
-        }
-    }
-
-    fn set_mode(
-        hold: bool,
-    ) -> impl Fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>) + 'static {
-        move |view, _, _, cx| {
-            view.mode_hold = hold;
-            cx.stop_propagation();
-            cx.notify();
-        }
-    }
-
-    fn toggle_flag(
-        which: u8,
-    ) -> impl Fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>) + 'static {
-        move |view, _, _, cx| {
-            match which {
-                0 => view.type_text = !view.type_text,
-                1 => view.beeps = !view.beeps,
-                2 => view.cleanup = !view.cleanup,
-                _ => {}
+    fn start_capture(&mut self, cx: &mut Context<Self>) {
+        self.active = None;
+        self.capture_note = None;
+        self.capture = Some(Capture {
+            key: hotkey::KeyCapture::start(),
+            started: Instant::now(),
+        });
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(30))
+                    .await;
+                let pending = this.update(cx, |view, cx| view.poll_capture(cx));
+                if !pending.unwrap_or(false) {
+                    break;
+                }
             }
-            cx.stop_propagation();
-            cx.notify();
-        }
-    }
-
-    fn toggle_reveal(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.reveal_key = !self.reveal_key;
-        cx.stop_propagation();
+        })
+        .detach();
         cx.notify();
     }
 
-    fn save(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        // Validate the hotkey before persisting.
-        if let Err(e) = hotkey::parse_key(self.hotkey.trim()) {
-            self.message = Some((format!("{e:#}"), true));
-            cx.notify();
-            return;
-        }
-        let cfg = Config {
-            api_key: Some(self.api_key.trim().to_string()).filter(|s| !s.is_empty()),
-            model: if self.model.trim().is_empty() {
-                crate::config::DEFAULT_MODEL.to_string()
-            } else {
-                self.model.trim().to_string()
-            },
-            language: Some(self.language.trim().to_string()).filter(|s| !s.is_empty()),
-            mode: if self.mode_hold {
-                "hold".into()
-            } else {
-                "toggle".into()
-            },
-            hotkey: self.hotkey.trim().to_string(),
-            mic: self.mic.clone(),
-            type_text: self.type_text,
-            beeps: self.beeps,
-            cleanup: self.cleanup,
-            cleanup_model: self.cleanup_model.clone(),
-            path: self.config_path.clone(),
+    /// Returns whether the capture is still waiting.
+    fn poll_capture(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(capture) = &self.capture else {
+            return false;
         };
-        match cfg.save() {
-            Ok(()) => {
-                let _ = self.tx.send(Command::Reload);
-                self.message = Some(("Saved.".into(), false));
+        let key = match capture.key.try_recv() {
+            Ok(key) => key,
+            Err(TryRecvError::Empty) if capture.started.elapsed() < CAPTURE_TIMEOUT => {
+                return true;
             }
-            Err(e) => self.message = Some((format!("{e:#}"), true)),
-        }
-        cx.stop_propagation();
+            Err(TryRecvError::Empty) => {
+                self.cancel_capture(cx);
+                self.capture_note = Some("No key detected. Is /dev/input readable?");
+                cx.notify();
+                return false;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.capture = None;
+                cx.notify();
+                return false;
+            }
+        };
+        self.capture = None;
+        let name = format!("{key:?}");
+        self.capture_note = if hotkey::is_typing_key(key) {
+            Some("That key types text — pick one like Right Ctrl or F13.")
+        } else if hotkey::parse_key(&name).is_err() {
+            Some("That key has no name. Try another.")
+        } else {
+            self.cfg.hotkey = name;
+            self.persist();
+            None
+        };
         cx.notify();
+        false
     }
 
-    fn close(&mut self, _: &MouseDownEvent, window: &mut Window, _: &mut Context<Self>) {
-        window.remove_window();
+    fn cancel_capture(&mut self, cx: &mut Context<Self>) {
+        if self.capture.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn set_flag(&mut self, flag: Flag) {
+        let slot = match flag {
+            Flag::TypeText => &mut self.cfg.type_text,
+            Flag::Beeps => &mut self.cfg.beeps,
+            Flag::Cleanup => &mut self.cfg.cleanup,
+        };
+        *slot = !*slot;
+        self.persist();
     }
 }
 
@@ -317,385 +349,626 @@ impl Focusable for SettingsView {
     }
 }
 
-// ── styling helpers ──────────────────────────────────────────────────────────
+// ── styling ──────────────────────────────────────────────────────────────────
 
-const BG: u32 = 0x10141c;
-const SURFACE: u32 = 0x171c27;
-const BORDER: u32 = 0x2a3040;
-const ACCENT: u32 = 0x6e8cff;
-const TEXT: u32 = 0xe2e6ee;
-const DIM: u32 = 0x8b93a3;
-const GREEN: u32 = 0x4ade80;
-const RED: u32 = 0xef4444;
+const BG: u32 = 0x0e1117;
+const CARD: u32 = 0x161a22;
+const CARD_BORDER: u32 = 0x232835;
+const DIVIDER: u32 = 0x1f2430;
+const RAISED: u32 = 0x262c3a;
+const HOVER: u32 = 0x1a1f29;
+const INPUT_BORDER: u32 = 0x2c3242;
+/// The pill's accent, so both windows read as one app.
+const ACCENT: u32 = 0x8da2fb;
+const TEXT: u32 = 0xe6e9ef;
+const MUTED: u32 = 0x8a92a3;
+const FAINT: u32 = 0x5b6375;
+const RED: u32 = 0xf87171;
 
-fn section_label(text: &'static str) -> gpui::Div {
-    div().text_xs().text_color(rgb(DIM)).mb_1().child(text)
+type Handler = Box<dyn Fn(&mut SettingsView, &mut Window, &mut Context<SettingsView>)>;
+
+/// A control's mouse-down listener: runs `f` and redraws, and keeps the root
+/// from treating the press as a click-away (which unfocuses fields and
+/// cancels a capture).
+fn on_press(
+    cx: &mut Context<SettingsView>,
+    f: impl Fn(&mut SettingsView, &mut Window, &mut Context<SettingsView>) + 'static,
+) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
+    cx.listener(move |view, _: &MouseDownEvent, window, cx| {
+        f(view, window, cx);
+        cx.stop_propagation();
+        cx.notify();
+    })
 }
 
-/// Device names can be long — cap chip labels so they don't overflow.
-fn truncate_label(s: &str) -> String {
-    const MAX: usize = 40;
-    if s.chars().count() > MAX {
-        format!("{}…", s.chars().take(MAX - 1).collect::<String>())
-    } else {
-        s.to_string()
-    }
+fn section(title: &'static str, rows: Vec<AnyElement>) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .pl(px(4.0))
+                .text_size(px(11.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(MUTED))
+                .child(title),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .rounded(px(12.0))
+                .bg(rgb(CARD))
+                .border_1()
+                .border_color(rgb(CARD_BORDER))
+                .overflow_hidden()
+                .children(rows.into_iter().enumerate().map(move |(i, row)| {
+                    div()
+                        .when(i > 0, |d| d.border_t_1().border_color(rgb(DIVIDER)))
+                        .child(row)
+                })),
+        )
+}
+
+/// A settings row: label (see `label_block`) on the left, control on the right.
+fn row(label: Div, control: impl IntoElement) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .min_h(px(40.0))
+        .px(px(14.0))
+        .py(px(6.0))
+        .child(label)
+        .child(div().flex_none().child(control))
+}
+
+/// A row's label with an optional second line in `detail_color`.
+fn label_block(
+    label: impl Into<SharedString>,
+    detail: Option<SharedString>,
+    detail_color: u32,
+) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .min_w_0()
+        .gap(px(2.0))
+        .child(
+            div()
+                .text_size(px(13.5))
+                .text_color(rgb(TEXT))
+                .truncate()
+                .child(label.into()),
+        )
+        .when_some(detail, |d, detail| {
+            d.child(
+                div()
+                    .text_size(px(12.0))
+                    .line_height(px(16.0))
+                    .text_color(rgb(detail_color))
+                    .child(detail),
+            )
+        })
+}
+
+fn switch(on: bool) -> Div {
+    div()
+        .flex_none()
+        .w(px(34.0))
+        .h(px(20.0))
+        .p(px(2.0))
+        .rounded_full()
+        .bg(rgb(if on { ACCENT } else { 0x343a49 }))
+        .child(
+            div()
+                .size(px(16.0))
+                .rounded_full()
+                .bg(rgb(if on { 0x0e1117 } else { 0xc9ced8 }))
+                .when(on, |d| d.ml(px(14.0))),
+        )
+}
+
+fn radio(selected: bool) -> Div {
+    div()
+        .flex_none()
+        .size(px(16.0))
+        .rounded_full()
+        .border_1()
+        .border_color(rgb(if selected { ACCENT } else { 0x4a5163 }))
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(selected, |d| {
+            d.child(div().size(px(8.0)).rounded_full().bg(rgb(ACCENT)))
+        })
+}
+
+fn segmented(
+    id: &'static str,
+    options: Vec<(SharedString, bool, Handler)>,
+    cx: &mut Context<SettingsView>,
+) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .p(px(2.0))
+        .gap(px(2.0))
+        .rounded(px(8.0))
+        .bg(rgb(BG))
+        .border_1()
+        .border_color(rgb(INPUT_BORDER))
+        .children(
+            options
+                .into_iter()
+                .enumerate()
+                .map(|(i, (label, selected, handler))| {
+                    div()
+                        .id(SharedString::from(format!("{id}-{i}")))
+                        .flex_1()
+                        .h(px(26.0))
+                        .px(px(8.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.0))
+                        .text_size(px(12.5))
+                        .whitespace_nowrap()
+                        .cursor_pointer()
+                        .when(selected, |d| {
+                            d.bg(rgb(RAISED))
+                                .text_color(rgb(TEXT))
+                                .font_weight(FontWeight::MEDIUM)
+                        })
+                        .when(!selected, |d| {
+                            d.text_color(rgb(MUTED)).hover(|s| s.text_color(rgb(TEXT)))
+                        })
+                        .on_mouse_down(MouseButton::Left, on_press(cx, handler))
+                        .child(label)
+                }),
+        )
 }
 
 impl SettingsView {
-    fn text_field(
+    fn text_input(
         &self,
         f: Field,
         placeholder: &'static str,
-        masked: bool,
+        width: Option<f32>,
         cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
+    ) -> Stateful<Div> {
         let active = self.active == Some(f);
-        let value = self.field(f);
-        let shown = if masked && !self.reveal_key {
-            if value.is_empty() {
-                String::new()
-            } else {
-                "•".repeat(value.len().min(24))
-            }
+        let masked = f == Field::ApiKey && !self.reveal_key;
+        let value = self.text(f);
+        let shown = if masked {
+            "•".repeat(value.chars().count().min(16))
         } else {
-            value.clone()
+            value.to_string()
         };
-        let mut el = div()
+        div()
             .id(match f {
                 Field::ApiKey => "f-key",
                 Field::Model => "f-model",
                 Field::Language => "f-lang",
-                Field::Hotkey => "f-hotkey",
             })
+            .map(|d| match width {
+                Some(w) => d.w(px(w)),
+                None => d.w_full(),
+            })
+            .h(px(30.0))
+            .px(px(10.0))
             .flex()
             .flex_row()
             .items_center()
-            .h(px(32.0))
-            .px_3()
-            .rounded_lg()
-            .bg(rgb(SURFACE))
-            .border_1()
-            .border_color(if active { rgb(ACCENT) } else { rgb(BORDER) })
-            .cursor_text()
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::activate(f)))
-            .child(if shown.is_empty() {
-                div().text_color(rgb(0x4b5265)).child(placeholder)
-            } else {
-                div().text_color(rgb(TEXT)).child(SharedString::from(shown))
-            });
-        if active {
-            el = el.child(div().w(px(1.5)).h(px(18.0)).ml(px(1.0)).bg(rgb(ACCENT)));
-        }
-        if masked {
-            el = el.child(
-                div()
-                    .id("reveal")
-                    .ml_auto()
-                    .pl_2()
-                    .text_xs()
-                    .text_color(rgb(DIM))
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(rgb(TEXT)))
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::toggle_reveal))
-                    .child(if self.reveal_key { "hide" } else { "show" }),
-            );
-        }
-        el
-    }
-
-    fn chip(
-        &self,
-        id: &str,
-        label: &str,
-        selected: bool,
-        handler: impl Fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>) + 'static,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        div()
-            .id(SharedString::from(format!("chip-{id}")))
-            .px_2p5()
-            .h(px(24.0))
-            .flex()
-            .items_center()
-            .rounded_md()
-            .text_xs()
-            .cursor_pointer()
-            .border_1()
-            .border_color(if selected { rgb(ACCENT) } else { rgb(BORDER) })
-            .bg(if selected {
-                rgba(0x6e8cff22)
-            } else {
-                rgba(0x00000000)
-            })
-            .text_color(if selected { rgb(ACCENT) } else { rgb(DIM) })
-            .hover(|s| s.border_color(rgb(ACCENT)))
-            .on_mouse_down(MouseButton::Left, cx.listener(handler))
-            .child(SharedString::from(label.to_string()))
-    }
-
-    fn toggle(
-        &self,
-        label: &'static str,
-        desc: &'static str,
-        on: bool,
-        which: u8,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        div()
-            .id(SharedString::from(format!("tog-{label}")))
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .py_0p5()
-            .cursor_pointer()
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::toggle_flag(which)))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(div().text_sm().text_color(rgb(TEXT)).child(label))
-                    .child(div().text_xs().text_color(rgb(DIM)).child(desc)),
-            )
-            .child(
-                div()
-                    .w(px(36.0))
-                    .h(px(20.0))
-                    .rounded_full()
-                    .bg(if on { rgb(ACCENT) } else { rgb(0x3a4152) })
-                    .p_px()
-                    .child(
-                        div()
-                            .size(px(18.0))
-                            .rounded_full()
-                            .bg(rgb(0xffffff))
-                            .ml(if on { px(16.0) } else { px(0.0) }),
-                    ),
-            )
-    }
-}
-
-impl SettingsView {
-    /// Scrollable body — everything above the pinned footer.
-    fn scroll_content(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        // Keep a configured-but-currently-unplugged device selectable.
-        let mut mic_names = self.mic_devices.clone();
-        if let Some(m) = &self.mic
-            && !mic_names.contains(m)
-        {
-            mic_names.push(m.clone());
-        }
-        div()
-            .id("settings-scroll")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .p_4()
             .gap_2()
-            .child(
-                div()
-                    .text_lg()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("Dictation Settings"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1p5()
-                    .child(section_label("OPENROUTER"))
-                    .child(div().text_xs().text_color(rgb(DIM)).child("API key"))
-                    .child(self.text_field(Field::ApiKey, "sk-or-…", true, cx))
-                    .child(div().text_xs().text_color(rgb(DIM)).child("Model"))
-                    .child(self.text_field(Field::Model, "provider/model", false, cx))
-                    .child(
-                        div().flex().flex_row().flex_wrap().gap_1p5().children(
-                            MODEL_PRESETS.iter().map(|m| {
-                                self.chip(m, m, self.model == *m, Self::pick_model(m), cx)
-                            }),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(DIM))
-                            .child("Language (blank = auto)"),
-                    )
-                    .child(self.text_field(Field::Language, "en", false, cx)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1p5()
-                    .child(section_label("DICTATION"))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_1p5()
-                            .child(self.chip(
-                                "hold",
-                                "Hold to talk",
-                                self.mode_hold,
-                                Self::set_mode(true),
-                                cx,
-                            ))
-                            .child(self.chip(
-                                "toggle",
-                                "Toggle",
-                                !self.mode_hold,
-                                Self::set_mode(false),
-                                cx,
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(DIM))
-                            .child("Hotkey (evdev name)"),
-                    )
-                    .child(self.text_field(Field::Hotkey, "KEY_RIGHTCTRL", false, cx))
-                    .child(
-                        div().flex().flex_row().flex_wrap().gap_1p5().children(
-                            HOTKEY_PRESETS.iter().map(|k| {
-                                self.chip(k, k, self.hotkey == *k, Self::pick_hotkey(k), cx)
-                            }),
-                        ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1p5()
-                    .child(section_label("MICROPHONE"))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .flex_wrap()
-                            .gap_1p5()
-                            .child(self.chip(
-                                "default",
-                                "System default",
-                                self.mic.is_none(),
-                                Self::pick_mic(None),
-                                cx,
-                            ))
-                            .children(mic_names.iter().map(|name| {
-                                self.chip(
-                                    name,
-                                    &truncate_label(name),
-                                    self.mic.as_deref() == Some(name.as_str()),
-                                    Self::pick_mic(Some(name.clone())),
-                                    cx,
-                                )
-                            })),
-                    )
-                    .when(self.mic_devices.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(DIM))
-                                .child("No input devices detected."),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(section_label("OUTPUT"))
-                    .child(self.toggle(
-                        "Type into focused window",
-                        "Virtual keyboard via uinput; falls back to clipboard",
-                        self.type_text,
-                        0,
-                        cx,
-                    ))
-                    .child(self.toggle(
-                        "Sound cues",
-                        "Short beeps on record start/stop",
-                        self.beeps,
-                        1,
-                        cx,
-                    ))
-                    .child(self.toggle(
-                        "Refine transcript",
-                        "Correct likely recognition errors, punctuation, and filler words",
-                        self.cleanup,
-                        2,
-                        cx,
-                    )),
-            )
-    }
-
-    /// Pinned footer — status message plus Close/Save, always visible.
-    fn footer(&self, cx: &mut Context<Self>) -> gpui::Div {
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .px_4()
-            .pb_4()
-            .pt_3()
-            .border_t_1()
-            .border_color(rgb(BORDER))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(match &self.message {
-                        Some((_, true)) => RED,
-                        Some((_, false)) => GREEN,
-                        None => DIM,
-                    }))
-                    .child(SharedString::from(match &self.message {
-                        Some((m, _)) => m.clone(),
-                        None => "Ctrl+V to paste into fields.".to_string(),
-                    })),
+            .rounded(px(8.0))
+            .bg(rgb(BG))
+            .border_1()
+            .border_color(rgb(if active { ACCENT } else { INPUT_BORDER }))
+            .text_size(px(13.0))
+            .cursor_text()
+            .on_mouse_down(
+                MouseButton::Left,
+                on_press(cx, move |view, _, cx| {
+                    view.active = Some(f);
+                    view.cancel_capture(cx);
+                }),
             )
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .gap_2()
+                    .items_center()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .when(shown.is_empty() && !active, |d| {
+                        d.child(div().text_color(rgb(FAINT)).child(placeholder))
+                    })
+                    .when(!shown.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_color(rgb(TEXT))
+                                .whitespace_nowrap()
+                                .child(SharedString::from(shown)),
+                        )
+                    })
+                    .when(active, |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .w(px(1.5))
+                                .h(px(16.0))
+                                .ml(px(1.0))
+                                .bg(rgb(ACCENT)),
+                        )
+                    }),
+            )
+            .when(f == Field::ApiKey && !value.is_empty(), |d| {
+                d.child(
+                    div()
+                        .id("reveal")
+                        .flex_none()
+                        .text_size(px(12.0))
+                        .text_color(rgb(MUTED))
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(rgb(TEXT)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            on_press(cx, |view, _, _| view.reveal_key = !view.reveal_key),
+                        )
+                        .child(if self.reveal_key { "Hide" } else { "Show" }),
+                )
+            })
+    }
+
+    fn keycap(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let capturing = self.capture.is_some();
+        div()
+            .id("keycap")
+            .h(px(30.0))
+            .min_w(px(96.0))
+            .px(px(12.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(8.0))
+            .border_1()
+            .border_b_2()
+            .text_size(px(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            .cursor_pointer()
+            .when(capturing, |d| {
+                d.bg(rgba(0x8da2fb1f))
+                    .border_color(rgb(ACCENT))
+                    .text_color(rgb(ACCENT))
+                    .child("Press a key…")
+            })
+            .when(!capturing, |d| {
+                d.bg(rgb(RAISED))
+                    .border_color(rgb(0x363d4e))
+                    .text_color(rgb(TEXT))
+                    .hover(|s| s.border_color(rgb(ACCENT)))
+                    .child(SharedString::from(hotkey::key_label(&self.cfg.hotkey)))
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                on_press(cx, |view, _, cx| {
+                    if view.capture.is_some() {
+                        view.cancel_capture(cx);
+                    } else {
+                        view.start_capture(cx);
+                    }
+                }),
+            )
+    }
+
+    /// A whole-row toggle: click anywhere on it.
+    fn switch_row(
+        &self,
+        label: &'static str,
+        detail: Option<&'static str>,
+        on: bool,
+        flag: Flag,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        row(
+            label_block(label, detail.map(SharedString::from), MUTED),
+            switch(on),
+        )
+        .id(label)
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(HOVER)))
+        .on_mouse_down(
+            MouseButton::Left,
+            on_press(cx, move |view, _, _| view.set_flag(flag)),
+        )
+        .into_any_element()
+    }
+
+    fn shortcut_section(&self, cx: &mut Context<Self>) -> Div {
+        let hold = self.cfg.mode != "toggle";
+        let key_detail = match (self.capture.is_some(), self.capture_note) {
+            (true, _) => Some("Esc to cancel".into()),
+            (false, Some(note)) => Some(note.into()),
+            (false, None) => None,
+        };
+        let note_color = if self.capture.is_none() && self.capture_note.is_some() {
+            RED
+        } else {
+            MUTED
+        };
+        let key_row = row(label_block("Key", key_detail, note_color), self.keycap(cx));
+        let mode = segmented(
+            "mode",
+            vec![
+                (
+                    "Hold".into(),
+                    hold,
+                    Box::new(|v: &mut Self, _: &mut Window, _: &mut Context<Self>| {
+                        v.cfg.mode = "hold".into();
+                        v.persist();
+                    }),
+                ),
+                (
+                    "Toggle".into(),
+                    !hold,
+                    Box::new(|v: &mut Self, _: &mut Window, _: &mut Context<Self>| {
+                        v.cfg.mode = "toggle".into();
+                        v.persist();
+                    }),
+                ),
+            ],
+            cx,
+        );
+        section(
+            "SHORTCUT",
+            vec![
+                key_row.into_any_element(),
+                row(
+                    label_block("Mode", None, MUTED),
+                    div().w(px(160.0)).child(mode),
+                )
+                .into_any_element(),
+            ],
+        )
+    }
+
+    fn mic_section(&self, cx: &mut Context<Self>) -> Div {
+        // Keep a configured-but-unplugged device visible and selected.
+        let mut names = self.mic_devices.clone();
+        if let Some(m) = &self.cfg.mic
+            && !names.contains(m)
+        {
+            names.push(m.clone());
+        }
+        let mut options: Vec<(Option<String>, String, String)> =
+            vec![(None, "System default".into(), String::new())];
+        for name in names {
+            // ALSA names read "Card, Input": lead with the card.
+            let (card, input) = name.split_once(", ").unwrap_or((name.as_str(), ""));
+            let detail = if self.mic_devices.contains(&name) {
+                input.to_string()
+            } else {
+                "Not connected".to_string()
+            };
+            options.push((Some(name.clone()), card.to_string(), detail));
+        }
+        let rows = options
+            .into_iter()
+            .enumerate()
+            .map(|(i, (value, label, detail))| {
+                let selected = self.cfg.mic == value;
+                div()
+                    .id(SharedString::from(format!("mic-{i}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .h(px(38.0))
+                    .px(px(14.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        on_press(cx, move |view, _, _| {
+                            view.cfg.mic = value.clone();
+                            view.persist();
+                        }),
+                    )
+                    .child(radio(selected))
                     .child(
                         div()
-                            .id("close")
-                            .px_4()
-                            .h(px(32.0))
-                            .flex()
-                            .items_center()
-                            .rounded_md()
-                            .text_sm()
-                            .text_color(rgb(DIM))
-                            .cursor_pointer()
-                            .hover(|s| s.text_color(rgb(TEXT)))
-                            .on_mouse_down(MouseButton::Left, cx.listener(Self::close))
-                            .child("Close"),
+                            .flex_none()
+                            .text_size(px(13.5))
+                            .text_color(rgb(TEXT))
+                            .child(label),
                     )
                     .child(
                         div()
-                            .id("save")
-                            .px_4()
-                            .h(px(32.0))
-                            .flex()
-                            .items_center()
-                            .rounded_md()
-                            .text_sm()
-                            .bg(rgb(ACCENT))
-                            .text_color(rgb(0xffffff))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x7d9bff)))
-                            .on_mouse_down(MouseButton::Left, cx.listener(Self::save))
-                            .child("Save"),
-                    ),
+                            .min_w_0()
+                            .text_size(px(12.5))
+                            .text_color(rgb(MUTED))
+                            .truncate()
+                            .child(detail),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        section("MICROPHONE", rows)
+    }
+
+    fn transcription_section(&self, cx: &mut Context<Self>) -> Div {
+        let key_row = if self.env_key {
+            row(
+                label_block("API key", None, MUTED),
+                div()
+                    .text_size(px(12.5))
+                    .text_color(rgb(MUTED))
+                    .child("From OPENROUTER_API_KEY"),
             )
+        } else {
+            let missing = self.text(Field::ApiKey).trim().is_empty();
+            row(
+                label_block("API key", None, MUTED).when(missing, |d| {
+                    d.child(
+                        div()
+                            .id("get-key")
+                            .text_size(px(12.0))
+                            .text_color(rgb(ACCENT))
+                            .cursor_pointer()
+                            .hover(|s| s.underline())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                on_press(cx, |_, _, cx| cx.open_url(KEYS_URL)),
+                            )
+                            .child("Get a key ↗"),
+                    )
+                }),
+                self.text_input(Field::ApiKey, "sk-or-…", Some(220.0), cx),
+            )
+        };
+
+        let mut model_options: Vec<(SharedString, bool, Handler)> = MODELS
+            .iter()
+            .map(|&(label, slug)| {
+                let selected = !self.custom_model && self.cfg.model == slug;
+                let handler: Handler =
+                    Box::new(move |v: &mut Self, _: &mut Window, _: &mut Context<Self>| {
+                        v.custom_model = false;
+                        v.active = None;
+                        v.cfg.model = slug.to_string();
+                        v.persist();
+                    });
+                (label.into(), selected, handler)
+            })
+            .collect();
+        model_options.push((
+            "Custom".into(),
+            self.custom_model,
+            Box::new(|v: &mut Self, _: &mut Window, _: &mut Context<Self>| {
+                v.custom_model = true;
+                v.active = Some(Field::Model);
+            }),
+        ));
+        let model_row = div()
+            .flex()
+            .flex_col()
+            .child(row(
+                label_block("Model", None, MUTED),
+                div()
+                    .w(px(300.0))
+                    .child(segmented("model", model_options, cx)),
+            ))
+            .when(self.custom_model, |d| {
+                d.child(div().px(px(14.0)).pb(px(10.0)).child(self.text_input(
+                    Field::Model,
+                    "provider/model",
+                    None,
+                    cx,
+                )))
+            });
+
+        section(
+            "TRANSCRIPTION",
+            vec![
+                key_row.into_any_element(),
+                model_row.into_any_element(),
+                row(
+                    label_block("Language", None, MUTED),
+                    self.text_input(Field::Language, "Auto-detect", Some(120.0), cx),
+                )
+                .into_any_element(),
+                self.switch_row(
+                    "Clean up transcript",
+                    Some("Fix punctuation, filler words, and misheard terms"),
+                    self.cfg.cleanup,
+                    Flag::Cleanup,
+                    cx,
+                ),
+            ],
+        )
+    }
+
+    fn output_section(&self, cx: &mut Context<Self>) -> Div {
+        section(
+            "OUTPUT",
+            vec![
+                self.switch_row(
+                    "Type into focused window",
+                    Some("The transcript is always copied to the clipboard too"),
+                    self.cfg.type_text,
+                    Flag::TypeText,
+                    cx,
+                ),
+                self.switch_row("Sound cues", None, self.cfg.beeps, Flag::Beeps, cx),
+            ],
+        )
+    }
+
+    fn header(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .text_size(px(17.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .child("Dictation"),
+                    )
+                    .child(div().text_size(px(12.5)).text_color(rgb(MUTED)).child(
+                        SharedString::from(tray::hint(&self.cfg.hotkey, &self.cfg.mode)),
+                    )),
+            )
+            .child(
+                div()
+                    .id("done")
+                    .h(px(30.0))
+                    .px(px(14.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(8.0))
+                    .bg(rgb(ACCENT))
+                    .text_size(px(13.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(BG))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0xa3b4fc)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        on_press(cx, |_, window, _| window.remove_window()),
+                    )
+                    .child("Done"),
+            )
+    }
+
+    /// A failed save, shown until the next one succeeds.
+    fn banner(&self) -> Option<Div> {
+        let text = self.save_error.clone()?;
+        Some(
+            div()
+                .px(px(12.0))
+                .py(px(9.0))
+                .rounded(px(10.0))
+                .bg(rgba(0xf8717126))
+                .border_1()
+                .border_color(rgba(0xf8717166))
+                .text_size(px(12.5))
+                .line_height(px(17.0))
+                .text_color(rgb(0xfecaca))
+                .child(SharedString::from(text)),
+        )
     }
 }
 
@@ -709,16 +982,92 @@ impl Render for SettingsView {
             .size_full()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
-            .flex()
-            .flex_col()
-            .child(self.scroll_content(cx))
-            .child(self.footer(cx))
+            .child(
+                div()
+                    .id("settings-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(12.0))
+                            .px(px(20.0))
+                            .pt(px(14.0))
+                            .pb(px(14.0))
+                            .child(self.header(cx))
+                            .children(self.banner())
+                            .child(self.shortcut_section(cx))
+                            .child(self.mic_section(cx))
+                            .child(self.transcription_section(cx))
+                            .child(self.output_section(cx)),
+                    ),
+            )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::delete_previous_word;
+    use super::*;
+    use evdev::KeyCode;
+    use gpui::TestAppContext;
+    use std::sync::mpsc::channel;
+
+    /// A pressed key becomes the hotkey (saved and reloaded at once) unless it
+    /// types text; silence ends the wait.
+    #[gpui::test]
+    fn captured_key_is_saved_unless_it_types(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = Config {
+            api_key: None,
+            model: crate::config::DEFAULT_MODEL.into(),
+            language: None,
+            mode: "hold".into(),
+            hotkey: "KEY_RIGHTCTRL".into(),
+            mic: None,
+            type_text: true,
+            beeps: true,
+            cleanup: true,
+            cleanup_model: crate::config::DEFAULT_CLEANUP_MODEL.into(),
+            path: path.clone(),
+        };
+        let (tx, reloads) = channel();
+        let window = cx.add_window(|window, cx| SettingsView::new(cfg, tx, window, cx));
+        // Poll once with `key` pressed (or none) after `waited`.
+        let poll = |cx: &mut TestAppContext, key: Option<KeyCode>, waited: Duration| {
+            let (press, key_capture) = hotkey::KeyCapture::detached();
+            if let Some(key) = key {
+                press.send(key).unwrap();
+            }
+            window
+                .update(cx, |view, _, cx| {
+                    view.capture = Some(Capture {
+                        key: key_capture,
+                        started: Instant::now() - waited,
+                    });
+                    assert!(!view.poll_capture(cx), "capture should be over");
+                    assert!(view.capture.is_none());
+                    (view.cfg.hotkey.clone(), view.capture_note)
+                })
+                .unwrap()
+        };
+
+        let (hotkey, note) = poll(cx, Some(KeyCode::KEY_A), Duration::ZERO);
+        assert_eq!(hotkey, "KEY_RIGHTCTRL");
+        assert!(note.is_some_and(|n| n.contains("types text")));
+        assert!(!path.exists() && reloads.try_recv().is_err());
+
+        let (_, note) = poll(cx, None, CAPTURE_TIMEOUT);
+        assert!(note.is_some_and(|n| n.contains("No key")));
+        assert!(!path.exists() && reloads.try_recv().is_err());
+
+        let (hotkey, note) = poll(cx, Some(KeyCode::KEY_F13), Duration::ZERO);
+        assert_eq!((hotkey.as_str(), note), ("KEY_F13", None));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains(r#"hotkey = "KEY_F13""#), "{saved}");
+        assert_eq!(reloads.try_recv(), Ok(Command::Reload));
+    }
 
     #[test]
     fn ctrl_backspace_handles_unicode_word_boundaries() {

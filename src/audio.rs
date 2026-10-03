@@ -126,7 +126,10 @@ fn device_name(device: &Device) -> Option<String> {
         .filter(|n| !n.trim().is_empty())
 }
 
-/// Names of input devices that can actually stream, for the settings picker.
+/// Names of sound-card inputs, for the settings picker. ALSA also lists its
+/// plugins ("Rate Converter Plugin…", "Discard all samples…") — not
+/// microphones; "System default" already covers the sound server. Not
+/// test-opened: a mic the sound server is briefly holding would vanish.
 pub fn input_device_names() -> Vec<String> {
     let host = cpal::default_host();
     let Ok(devices) = host.input_devices() else {
@@ -135,7 +138,7 @@ pub fn input_device_names() -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut names = Vec::new();
     for d in devices {
-        if d.default_input_config().is_err() {
+        if !d.id().is_ok_and(|id| is_card_input(id.id())) {
             continue;
         }
         if let Some(name) = device_name(&d)
@@ -145,6 +148,15 @@ pub fn input_device_names() -> Vec<String> {
         }
     }
     names
+}
+
+/// A card's capture PCMs: `sysdefault:CARD=…`, `front:CARD=…`, `hw:CARD=…`,
+/// `plughw:CARD=…`. Plugins and sound servers have bare names (`lavrate`,
+/// `pipewire`); `usbstream:` and other per-card PCMs can't record.
+fn is_card_input(alsa_id: &str) -> bool {
+    ["sysdefault:", "front:", "hw:", "plughw:"]
+        .iter()
+        .any(|prefix| alsa_id.starts_with(prefix))
 }
 
 /// Pick the input device for `mic` (None/blank = system default). A configured
