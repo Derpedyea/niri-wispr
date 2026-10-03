@@ -61,10 +61,27 @@ impl Config {
     }
 
     pub fn load() -> Result<Config> {
+        Self::load_with_env(std::env::var("OPENROUTER_API_KEY").ok())
+    }
+
+    /// The file alone, without the OPENROUTER_API_KEY override — what
+    /// Settings edits, so saving never copies the env key into the file.
+    pub fn load_file() -> Result<Config> {
+        Self::load_with_env(None)
+    }
+
+    /// Read this config's file again — file values only, like `load_file`.
+    pub fn reread(&self) -> Result<Config> {
+        Self::read(self.path.clone(), None)
+    }
+
+    fn load_with_env(env_api_key: Option<String>) -> Result<Config> {
         // Honor XDG_CONFIG_HOME, but fall back to ~/.config so the app still
         // finds its config when launched from environments that override it.
-        let path = Self::default_path();
+        Self::read(Self::default_path(), env_api_key)
+    }
 
+    fn read(path: PathBuf, env_api_key: Option<String>) -> Result<Config> {
         let file: FileConfig = match std::fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text)
                 .with_context(|| format!("failed to parse {}", path.display()))?,
@@ -72,7 +89,6 @@ impl Config {
             Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
         };
 
-        let env_api_key = std::env::var("OPENROUTER_API_KEY").ok();
         Ok(from_file(path, file, env_api_key))
     }
 

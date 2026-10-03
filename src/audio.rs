@@ -126,25 +126,61 @@ fn device_name(device: &Device) -> Option<String> {
         .filter(|n| !n.trim().is_empty())
 }
 
-/// Names of input devices that can actually stream, for the settings picker.
-pub fn input_device_names() -> Vec<String> {
-    let host = cpal::default_host();
-    let Ok(devices) = host.input_devices() else {
-        return Vec::new();
+/// Input device names: `all` as recording resolves them, `cards` for the
+/// settings picker. ALSA also lists its plugins ("Rate Converter Plugin…",
+/// "Discard all samples…") — not microphones; "System default" already
+/// covers the sound server. Not test-opened: a mic the sound server is
+/// briefly holding would vanish.
+pub struct InputDevices {
+    pub all: Vec<String>,
+    pub cards: Vec<String>,
+}
+
+pub fn input_devices() -> InputDevices {
+    let mut found = InputDevices {
+        all: Vec::new(),
+        cards: Vec::new(),
     };
-    let mut seen = std::collections::HashSet::new();
-    let mut names = Vec::new();
+    let Ok(devices) = cpal::default_host().input_devices() else {
+        return found;
+    };
     for d in devices {
-        if d.default_input_config().is_err() {
+        let Some(name) = device_name(&d) else {
             continue;
+        };
+        if d.id().is_ok_and(|id| is_card_input(id.id())) && !found.cards.contains(&name) {
+            found.cards.push(name.clone());
         }
-        if let Some(name) = device_name(&d)
-            && seen.insert(name.clone())
-        {
-            names.push(name);
+        if !found.all.contains(&name) {
+            found.all.push(name);
         }
     }
-    names
+    found
+}
+
+/// Which of `names` a configured `mic` means: the exact name, else the first
+/// containing it, ignoring case. Recording and the settings picker both use
+/// it, so they agree on which device a setting like "USB" picks.
+pub fn match_mic(want: &str, names: &[String]) -> Option<usize> {
+    let want = want.trim();
+    if want.is_empty() {
+        return None;
+    }
+    names.iter().position(|name| name == want).or_else(|| {
+        let want = want.to_lowercase();
+        names
+            .iter()
+            .position(|name| name.to_lowercase().contains(&want))
+    })
+}
+
+/// A card's capture PCMs: `sysdefault:CARD=…`, `front:CARD=…`, `hw:CARD=…`,
+/// `plughw:CARD=…`. Plugins and sound servers have bare names (`lavrate`,
+/// `pipewire`); `usbstream:` and other per-card PCMs can't record.
+fn is_card_input(alsa_id: &str) -> bool {
+    ["sysdefault:", "front:", "hw:", "plughw:"]
+        .iter()
+        .any(|prefix| alsa_id.starts_with(prefix))
 }
 
 /// Pick the input device for `mic` (None/blank = system default). A configured
@@ -156,29 +192,19 @@ fn pick_input_device(mic: Option<&str>) -> Result<Device> {
             .default_input_device()
             .ok_or_else(|| anyhow!("no default input device found"));
     };
-    let mut partial = None;
-    let mut available = Vec::new();
-    let devices = host
+    let mut devices: Vec<(String, Device)> = host
         .input_devices()
-        .context("failed to list input devices")?;
-    for d in devices {
-        let Some(name) = device_name(&d) else {
-            continue;
-        };
-        if name == want {
-            return Ok(d);
-        }
-        if partial.is_none() && name.to_lowercase().contains(&want.to_lowercase()) {
-            partial = Some(d);
-        }
-        available.push(name);
-    }
-    partial.ok_or_else(|| {
-        anyhow!(
+        .context("failed to list input devices")?
+        .filter_map(|d| Some((device_name(&d)?, d)))
+        .collect();
+    let names: Vec<String> = devices.iter().map(|(name, _)| name.clone()).collect();
+    match match_mic(want, &names) {
+        Some(index) => Ok(devices.swap_remove(index).1),
+        None => Err(anyhow!(
             "microphone {want:?} not found (available: {})",
-            available.join(", ")
-        )
-    })
+            names.join(", ")
+        )),
+    }
 }
 
 /// Start capturing from the configured input device (`mic` = device name,
@@ -311,9 +337,19 @@ mod tests {
     }
 
     #[test]
+    fn configured_mic_prefers_an_exact_name_then_a_substring() {
+        let names = ["USB Microphone, USB Audio", "USB", "Webcam Mic"].map(String::from);
+        assert_eq!(match_mic("USB", &names), Some(1));
+        assert_eq!(match_mic(" usb micro ", &names), Some(0));
+        assert_eq!(match_mic("webcam", &names), Some(2));
+        assert_eq!(match_mic("Studio", &names), None);
+        assert_eq!(match_mic("  ", &names), None);
+    }
+
+    #[test]
     #[ignore] // needs real audio hardware — run with --ignored
     fn lists_and_opens_input_devices() {
-        let names = super::input_device_names();
+        let names = super::input_devices().cards;
         for n in &names {
             eprintln!("input device: {n}");
         }

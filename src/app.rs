@@ -2,6 +2,7 @@ use crate::audio::Recording;
 use crate::config::Config;
 use crate::hotkey::Watcher;
 use crate::ipc::Command;
+use crate::tray::{self, Tray};
 use crate::typer::Typer;
 use crate::{api, audio, beep, hotkey, niri, settings};
 use gpui::{
@@ -84,6 +85,9 @@ pub struct DictationView {
     /// would outlive the release that already went by.
     start_pending: bool,
     shutting_down: bool,
+    tray: Option<Tray>,
+    /// What the tray icon currently shows, so it's only updated on change.
+    tray_recording: bool,
     waveform: [f32; BAR_COUNT],
     smoothed_level: f32,
     message_expires_at: Option<Instant>,
@@ -103,6 +107,7 @@ impl DictationView {
         tx: Sender<Command>,
         typer: Option<Typer>,
         watcher: Option<Watcher>,
+        tray: Option<Tray>,
         cx: &mut Context<Self>,
     ) -> Self {
         let view = Self {
@@ -120,6 +125,8 @@ impl DictationView {
             typing_cancel: None,
             start_pending: false,
             shutting_down: false,
+            tray,
+            tray_recording: false,
             waveform: [0.0; BAR_COUNT],
             smoothed_level: 0.0,
             message_expires_at: None,
@@ -146,6 +153,7 @@ impl DictationView {
                     let mut changed = view.drain_commands(cx);
                     changed |= view.fail_recording_if_needed();
                     changed |= view.cue_if_due();
+                    view.sync_tray();
                     if let Some(level) = view.recording.as_ref().map(|rec| rec.capture.level()) {
                         push_waveform(&mut view.waveform, &mut view.smoothed_level, level);
                         changed = true;
@@ -229,6 +237,18 @@ impl DictationView {
         }
     }
 
+    /// The tray mic goes red with the pill: only once a recording is cued, so
+    /// taps and shortcuts stay invisible there too.
+    fn sync_tray(&mut self) {
+        let recording = matches!(self.status, Status::Recording { cued: true, .. });
+        if recording != self.tray_recording {
+            self.tray_recording = recording;
+            if let Some(tray) = &self.tray {
+                tray.set_recording(recording);
+            }
+        }
+    }
+
     fn drain_commands(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         while let Ok(command) = self.rx.try_recv() {
@@ -305,6 +325,11 @@ impl DictationView {
                 }
                 Err(error) => self.show_error(format!("hotkey: {error:#}")),
             }
+        }
+        if let Some(tray) = &self.tray
+            && (new.hotkey != self.config.hotkey || new.mode != self.config.mode)
+        {
+            tray.set_hint(tray::hint(&new.hotkey, &new.mode));
         }
         self.config = new;
     }
@@ -909,6 +934,7 @@ mod tests {
                 tx,
                 type_text.then(typer),
                 Some(Watcher::for_test()),
+                None,
                 cx,
             )
         })

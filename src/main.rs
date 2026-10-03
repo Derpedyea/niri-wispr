@@ -7,6 +7,7 @@ mod hotkey;
 mod ipc;
 mod niri;
 mod settings;
+mod tray;
 mod typer;
 
 use app::DictationView;
@@ -161,6 +162,15 @@ fn main() {
         None
     };
 
+    // The icon in the bar's tray (Noctalia, Waybar, …): opens Settings.
+    let tray = match tray::Tray::spawn(tx.clone(), tray::hint(&config.hotkey, &config.mode)) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            eprintln!("tray: {e:#}");
+            None
+        }
+    };
+
     let tx2 = tx.clone();
     Application::new().run(move |cx: &mut App| {
         cx.bind_keys([
@@ -171,7 +181,8 @@ fn main() {
         ]);
 
         cx.set_quit_on_last_window_close(false);
-        let view = cx.new(|cx| DictationView::new(config.clone(), rx, tx2, typer, watcher, cx));
+        let view =
+            cx.new(|cx| DictationView::new(config.clone(), rx, tx2, typer, watcher, tray, cx));
         cx.set_global(DictationApp { _view: view });
     });
     beep::shutdown();

@@ -86,8 +86,10 @@ Clicking the pill also toggles recording. When the pill has focus:
 
 ## Configuration
 
-`dictationapp --settings` opens a GUI that edits the config and hot-reloads
-the running app — you never have to touch the file. Packaged installs also
+A microphone icon sits in your bar's tray (Noctalia, Waybar, KDE — anything
+that hosts StatusNotifierItems) and turns red while you're recording. Click
+it, or run `dictationapp --settings`, to open Settings: changes apply as you
+make them, and you set the hotkey by pressing it. Packaged installs also
 ship a **Dictation Settings** launcher entry, so it shows up in app
 launchers like fuzzel or the noctalia launcher. For a source install, copy
 it yourself:
@@ -249,6 +251,7 @@ and [docs/window-lifecycle.md](docs/window-lifecycle.md) for native verification
 | `typer.rs` | Unicode insertion through a Wayland virtual keyboard |
 | `ipc.rs` | Ordered CLI commands, acknowledgements, and lifetime-held instance lock |
 | `settings.rs` | settings window |
+| `tray.rs` | tray icon in the bar |
 | `beep.rs` | audio cues |
 | `niri.rs` | pill positioning via `niri msg` |
 | `config.rs` | config.toml load/save |
