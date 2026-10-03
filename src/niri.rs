@@ -39,6 +39,30 @@ fn spawn_place(delay: Duration) {
     });
 }
 
+/// Bring our open Settings window forward (switching workspace if needed).
+/// GPUI's own activation request carries no input serial, so niri ignores it.
+pub fn focus_settings() {
+    std::thread::spawn(|| {
+        if let Err(e) = focus_own_window("Dictation Settings") {
+            eprintln!("niri: could not focus settings: {e:#}");
+        }
+    });
+}
+
+fn focus_own_window(title: &str) -> Result<()> {
+    let windows = msg_json(&["windows"])?;
+    let pid = u64::from(std::process::id());
+    let id = windows
+        .as_array()
+        .and_then(|w| {
+            w.iter()
+                .find(|w| w["pid"].as_u64() == Some(pid) && w["title"].as_str() == Some(title))
+        })
+        .and_then(|w| w["id"].as_u64())
+        .with_context(|| format!("no window titled {title:?}"))?;
+    run_action(&["focus-window", "--id", &id.to_string()])
+}
+
 fn place() -> Result<()> {
     let windows = msg_json(&["windows"])?;
     let win = windows

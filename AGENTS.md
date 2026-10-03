@@ -31,8 +31,8 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
 ## Architecture
 
 - `main.rs` — CLI dispatch (`--toggle/--start/--stop/--cancel/--quit`), GPUI app bootstrap,
-  wires channel → IPC listener + evdev hotkey + Wayland typer; retains the view in an
-  app global so the service stays alive without any windows.
+  wires channel → IPC listener + evdev hotkey + Wayland typer + tray icon; retains the view
+  in an app global so the service stays alive without any windows.
 - `app.rs` — GPUI pill UI + command pump (`cx.spawn` + `timer` poll of `mpsc::Receiver`),
   state machine Idle → Recording → Transcribing → Cleaning → Typing. Capture starts on Start,
   but the beep and pill — or a start failure (no API key, no mic) — wait `hotkey::MIN_HOLD`
@@ -43,8 +43,11 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
   Active recording shows a 21-sample waveform from measured input levels. Window creation
   runs outside the view update because opening a GPUI window renders its root immediately.
 - `audio.rs` — cpal capture to mono f32 + hound WAV encode. `mic` config selects the input
-  device by name (exact, else case-insensitive substring; unset = system default).
-  `input_device_names()` lists streamable devices for the settings picker.
+  device by name (exact, else case-insensitive substring; unset = system default) through
+  `match_mic`, which the settings picker shares so both agree on which device "USB" means.
+  `input_device_names()` lists sound-card capture PCMs (`hw:`/`plughw:`/`front:`/`sysdefault:`)
+  for the settings picker — not ALSA plugins — without test-opening them: a mic the
+  sound server is briefly holding (right after a dictation) must not vanish from the list.
 - `api.rs` — OpenRouter transcription (`POST /api/v1/audio/transcriptions`) followed optionally
   by conservative text cleanup (`POST /api/v1/chat/completions`); cleanup failure falls back to
   the raw transcript.
@@ -58,6 +61,10 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
   key during the hold→Cancel (it's a shortcut like RightCtrl+C); a Ctrl/Shift/Alt/Super already
   held at press makes it a shortcut too (Ctrl+C with hotkey C). Toggle mode: release of a
   lone tap→Toggle. No time debounce — one dropped a quick tap's release and left recordings running.
+  `KeyCapture` (Settings' "press a key") is answered by the watcher from the same event
+  stream, and the captured press counts as a chord, so pressing the current hotkey there
+  never starts a dictation. Esc stays pending for Settings to cancel, but can't drive the
+  hotkey while a capture waits. Dropping the handle withdraws the request.
 - `typer.rs` — in-process Wayland virtual keyboard (`zwp_virtual_keyboard_v1`) with
   per-transcript keymaps: independent of physical layout/CapsLock and invisible to evdev.
   Text only borrows printable keycodes — Chromium/Electron/terminals act on Backspace,
@@ -73,9 +80,20 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
   cross-output via `move-window-to-monitor` (lands on the focused workspace), same-output
   via `move-window-to-workspace` (index resolves on the window's own output). Note:
   `move-floating-window` y is relative to the work area below any top-bar strut.
-- `settings.rs` — second gpui window (`dictationapp --settings`) with fields for API key,
-  speech model, language, hotkey, mode, output, sound, and transcript cleanup. Save writes
-  config.toml and sends `Command::Reload` — the pill hot-reloads.
+- `settings.rs` — second gpui window (`dictationapp --settings`, tray click): shortcut (set by
+  pressing the key; letters/Space are rejected), mode, mic, API key, model presets + Custom,
+  language, cleanup, typing, sounds. Every change saves at once and sends `Command::Reload`;
+  there is no Save button. Edits file values only (`Config::load_file`), so an
+  `OPENROUTER_API_KEY` is shown read-only and never written into the file. Rereads the file and
+  re-lists mics whenever the window is focused or reopened (the one window is reused), so
+  outside edits aren't overwritten and new mics appear; an unreadable file pauses saving.
+  `focus_field` is the only way to focus a text field and ends any pending key capture. One window: a second open focuses it via
+  `niri msg action focus-window`.
+- `tray.rs` — StatusNotifierItem via `ksni` (blocking API on the async-io zbus already in the
+  tree). Symbolic mic icon, which Noctalia tints to its bar color; while a cued recording
+  runs, status NeedsAttention + a procedurally drawn red-mic *pixmap* — Noctalia tints every
+  symbolic SVG, so only a pixmap can be red there. Click → Settings, menu → Settings/Quit.
+  `assume_sni_available` so it waits for the bar instead of failing at niri startup.
 - `config.rs` — `~/.config/dictationapp/config.toml` (+ `OPENROUTER_API_KEY` env wins).
   `cleanup` defaults to true and `cleanup_model` defaults to `inclusionai/ling-3.0-flash`.
   Note: honors XDG_CONFIG_HOME first, falls back to `~/.config` — T3 Code shells override XDG.
@@ -91,6 +109,7 @@ the toplevel on Wayland):
   Min/max pinning is required because niri does not honor the
   client's requested size for floating windows.
 - `title="Dictation Settings"`: `open-floating true`, `min/max 460x760` (floats open centered).
+  The layout is sized to fit 760px with ~3 mics; more scroll.
 
 `~/.config/niri/cfg/keybinds.kdl` — no dictation bind (a `Super+D` toggle was removed: stray
 toggles caused invisible recordings). Re-add a `spawn ".../dictationapp" "--toggle"` inside the
