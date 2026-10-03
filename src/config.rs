@@ -211,9 +211,15 @@ fn replace_config(path: &Path, write: impl FnOnce(&mut File) -> std::io::Result<
         return Err(error);
     }
     match temp.persist(path) {
-        Ok(_) => directory
-            .sync_all()
-            .context("config replaced, but its directory could not be synced"),
+        // The rename already committed: the new config is what's on disk and
+        // what Reload must apply. Some FUSE/network filesystems reject
+        // directory fsync; that only weakens crash durability, so warn.
+        Ok(_) => {
+            if let Err(error) = directory.sync_all() {
+                eprintln!("config saved, but its directory could not be synced: {error}");
+            }
+            Ok(())
+        }
         Err(error) => {
             let tempfile::PersistError { error, file } = error;
             close_temp(file).with_context(|| format!("config replacement failed: {error}"))?;
