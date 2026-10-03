@@ -36,6 +36,13 @@ impl Status {
     fn is_active(&self) -> bool {
         !matches!(self, Status::Idle)
     }
+
+    fn is_delivering(&self) -> bool {
+        matches!(
+            self,
+            Status::Transcribing | Status::Cleaning | Status::Typing
+        )
+    }
 }
 
 const BAR_COUNT: usize = 21;
@@ -71,6 +78,11 @@ pub struct DictationView {
     watcher: Option<Watcher>,
     /// Shared with the delivery child; settings changes and every shutdown stop it.
     typing_cancel: Option<Arc<AtomicBool>>,
+    /// A start (hold press, `--start`, or toggle) that arrived while the last
+    /// transcript was still being delivered. It records once idle, unless its
+    /// gesture ends first — dropping it would lose speech; replaying it alone
+    /// would outlive the release that already went by.
+    start_pending: bool,
     shutting_down: bool,
     waveform: [f32; BAR_COUNT],
     smoothed_level: f32,
@@ -106,6 +118,7 @@ impl DictationView {
             typer: typer.map(|t| Arc::new(Mutex::new(t))),
             watcher,
             typing_cancel: None,
+            start_pending: false,
             shutting_down: false,
             waveform: [0.0; BAR_COUNT],
             smoothed_level: 0.0,
@@ -183,19 +196,21 @@ impl DictationView {
             }
             Command::Toggle => match self.status {
                 Status::Recording { .. } => self.stop_and_transcribe(cx),
-                Status::Idle => self.start_recording(cx),
+                Status::Idle => self.start_recording(),
                 Status::StartFailed { error, .. } => self.show_start_failure(error),
+                Status::Transcribing | Status::Cleaning | Status::Typing => {
+                    self.start_pending = !self.start_pending;
+                }
+            },
+            Command::Start => match self.status {
+                Status::Idle => self.start_recording(),
+                _ if self.status.is_delivering() => self.start_pending = true,
                 _ => {}
             },
-            Command::Start => {
-                if matches!(self.status, Status::Idle) {
-                    self.start_recording(cx);
-                }
-            }
             Command::Stop => match self.status {
                 Status::Recording { .. } => self.stop_and_transcribe(cx),
                 Status::StartFailed { error, .. } => self.show_start_failure(error),
-                _ => {}
+                _ => self.start_pending = false,
             },
             Command::Cancel => {
                 self.cancel_recording();
@@ -295,6 +310,7 @@ impl DictationView {
     }
 
     fn cancel_recording(&mut self) {
+        self.start_pending = false;
         if matches!(
             self.status,
             Status::Recording { .. } | Status::StartFailed { .. }
@@ -344,7 +360,7 @@ impl DictationView {
         true
     }
 
-    fn start_recording(&mut self, _cx: &mut Context<Self>) {
+    fn start_recording(&mut self) {
         // Before opening the mic, so its latency counts toward the cue delay.
         let started = Instant::now();
         let error = if self.config.api_key.is_none() {
@@ -491,7 +507,8 @@ impl DictationView {
                 }
                 Ok(_) => {
                     this.update(cx, |view, cx| {
-                        view.status = Status::Idle;
+                        view.drain_commands(cx);
+                        view.finish_delivery();
                         view.show_notice("No speech detected. Try again.");
                         cx.notify();
                     })
@@ -501,7 +518,8 @@ impl DictationView {
                 Err(e) => {
                     eprintln!("transcription error: {e:#}");
                     this.update(cx, |view, cx| {
-                        view.status = Status::Idle;
+                        view.drain_commands(cx);
+                        view.finish_delivery();
                         view.show_error(
                             "Transcription failed. Check your connection and speech model.",
                         );
@@ -562,7 +580,8 @@ impl DictationView {
                     .await;
                 this.update(cx, |view, cx| {
                     view.typing_cancel = None;
-                    view.status = Status::Idle;
+                    view.drain_commands(cx);
+                    view.finish_delivery();
                     if cancelled.load(Ordering::Acquire) {
                         view.clear_message();
                     } else {
@@ -586,23 +605,13 @@ impl DictationView {
 
     fn prepare_delivery(&mut self, text: &str, cx: &mut Context<Self>) -> Option<Delivery> {
         // Save may have queued Reload while the periodic pump is still waiting
-        // for its next tick. Apply it before choosing clipboard-only vs typing;
-        // anything else runs once delivery has begun, as on that next tick.
-        let (settings, later): (Vec<_>, Vec<_>) = self
-            .rx
-            .try_iter()
-            .partition(|command| matches!(command, Command::Reload | Command::Quit));
-        for command in settings {
-            self.handle_command(command, cx);
-        }
+        // for its next tick. Apply it before choosing clipboard-only vs typing.
+        self.drain_commands(cx);
         if self.shutting_down {
             return None;
         }
         cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
         let delivery = self.begin_delivery();
-        for command in later {
-            self.handle_command(command, cx);
-        }
         cx.notify();
         delivery
     }
@@ -615,9 +624,19 @@ impl DictationView {
             self.status = Status::Typing;
             Some(Delivery { typer, cancelled })
         } else {
-            self.status = Status::Idle;
             self.clear_message();
+            self.finish_delivery();
             None
+        }
+    }
+
+    /// Delivery is over. Callers first drain commands sent meanwhile, applied
+    /// as still busy, so a start whose gesture already ended stays dropped and
+    /// only one still pending records.
+    fn finish_delivery(&mut self) {
+        self.status = Status::Idle;
+        if std::mem::take(&mut self.start_pending) && !self.shutting_down {
+            self.start_recording();
         }
     }
 
@@ -1036,6 +1055,36 @@ mod tests {
             assert!(view.prepare_delivery("done", cx).is_none());
             // No API key in tests, so a handled Start reaches StartFailed.
             assert!(matches!(view.status, Status::StartFailed { .. }));
+        });
+    }
+
+    #[gpui::test]
+    fn start_during_typing_records_once_delivery_finishes(cx: &mut TestAppContext) {
+        let view = view(cx, true);
+        view.update(cx, |view, cx| {
+            view.status = Status::Transcribing;
+            view.tx.send(Command::Start).unwrap();
+            assert!(view.prepare_delivery("done", cx).is_some());
+            assert!(matches!(view.status, Status::Typing));
+            view.drain_commands(cx);
+            view.finish_delivery();
+            // No API key in tests, so the started recording reaches StartFailed.
+            assert!(matches!(view.status, Status::StartFailed { .. }));
+
+            // A gesture that ends while still busy records nothing afterwards,
+            // even when its end is still queued as delivery finishes.
+            for (start, end) in [
+                (Command::Start, Command::Stop),
+                (Command::Start, Command::Cancel),
+                (Command::Toggle, Command::Toggle),
+            ] {
+                view.status = Status::Typing;
+                view.handle_command(start, cx);
+                view.tx.send(end).unwrap();
+                view.drain_commands(cx);
+                view.finish_delivery();
+                assert!(matches!(view.status, Status::Idle), "{start:?} {end:?}");
+            }
         });
     }
 

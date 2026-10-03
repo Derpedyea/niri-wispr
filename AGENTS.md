@@ -38,6 +38,8 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
   but the beep and pill — or a start failure (no API key, no mic) — wait `hotkey::MIN_HOLD`
   (250ms), so taps and shortcuts the hotkey cancels before then stay invisible. Creates the pill
   only while active or showing a message, and removes the native window when idle.
+  A start during Transcribing/Cleaning/Typing is held and records once delivery ends,
+  unless its gesture (release, `--stop`, second toggle) ends first.
   Active recording shows a 21-sample waveform from measured input levels. Window creation
   runs outside the view update because opening a GPUI window renders its root immediately.
 - `audio.rs` — cpal capture to mono f32 + hound WAV encode. `mic` config selects the input
