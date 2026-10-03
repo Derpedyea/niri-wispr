@@ -8,8 +8,8 @@ transcript is typed into the focused window (and copied to clipboard).
 ```bash
 cargo build                    # debug binary at target/debug/dictationapp
 cargo install --path .         # release install to ~/.cargo/bin/dictationapp
-cargo test                     # unit tests (evdev round-trip needs /dev/uinput + readable /dev/input)
-cargo test -- --ignored        # network test (needs OPENROUTER_API_KEY + /tmp/speech.wav)
+cargo test                     # deterministic tests; no desktop input
+cargo test -- --ignored        # opt-in hardware/input + network tests
 ```
 
 ## Releasing
@@ -31,13 +31,15 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
 ## Architecture
 
 - `main.rs` — CLI dispatch (`--toggle/--start/--stop/--cancel/--quit`), GPUI app bootstrap,
-  wires channel → IPC listener + evdev hotkey + uinput typer; retains the view in an
+  wires channel → IPC listener + evdev hotkey + Wayland typer; retains the view in an
   app global so the service stays alive without any windows.
 - `app.rs` — GPUI pill UI + command pump (`cx.spawn` + `timer` poll of `mpsc::Receiver`),
   state machine Idle → Recording → Transcribing → Cleaning → Typing. Capture starts on Start,
   but the beep and pill — or a start failure (no API key, no mic) — wait `hotkey::MIN_HOLD`
   (250ms), so taps and shortcuts the hotkey cancels before then stay invisible. Creates the pill
   only while active or showing a message, and removes the native window when idle.
+  A start during Transcribing/Cleaning/Typing is held and records once delivery ends,
+  unless its gesture (release, `--stop`, second toggle) ends first.
   Active recording shows a 21-sample waveform from measured input levels. Window creation
   runs outside the view update because opening a GPUI window renders its root immediately.
 - `audio.rs` — cpal capture to mono f32 + hound WAV encode. `mic` config selects the input
@@ -46,14 +48,22 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
 - `api.rs` — OpenRouter transcription (`POST /api/v1/audio/transcriptions`) followed optionally
   by conservative text cleanup (`POST /api/v1/chat/completions`); cleanup failure falls back to
   the raw transcript.
-- `ipc.rs` — Unix socket at `$XDG_RUNTIME_DIR/dictationapp-$USER.sock`; stale socket takeover on bind.
+- `ipc.rs` — Unix socket at `$XDG_RUNTIME_DIR/dictationapp-$USER.sock`; ordered,
+  bounded command dispatch acknowledges enqueue before the CLI returns. A retained
+  `Server` owns the worker and a persistent sibling `.lock` inode through shutdown;
+  stale sockets are recovered under that lock. Never unlink the lock file.
 - `hotkey.rs` — evdev: watches every readable `/dev/input/event*` supporting the hotkey.
   One hold state is shared across devices. Hold mode: press→Start, release→Stop (Cancel if
   held under `MIN_HOLD` — timed here from key events, since the app sees commands late), any other
   key during the hold→Cancel (it's a shortcut like RightCtrl+C); a Ctrl/Shift/Alt/Super already
   held at press makes it a shortcut too (Ctrl+C with hotkey C). Toggle mode: release of a
   lone tap→Toggle. No time debounce — one dropped a quick tap's release and left recordings running.
-- `typer.rs` — evdev uinput virtual keyboard; types text into whatever window is focused.
+- `typer.rs` — in-process Wayland virtual keyboard (`zwp_virtual_keyboard_v1`) with
+  per-transcript keymaps: independent of physical layout/CapsLock and invisible to evdev.
+  Text only borrows printable keycodes — Chromium/Electron/terminals act on Backspace,
+  Escape, F-keys etc. by scancode whatever the keysym (why not wtype: atx/wtype#71).
+  Keys are paced: niri disconnects a client whose socket fills. Verify against a real
+  client with `scripts/check-typing.py` (headless niri + Chrome).
 - `beep.rs` — start/stop/error audio cues; WAVs generated once into `dirs::cache_dir()/dictationapp`,
   played via pw-play/paplay/aplay. `beeps = false` in config disables.
 - `niri.rs` — moves the pill to bottom-center of the **focused** output via `niri msg`
@@ -93,8 +103,11 @@ toggles caused invisible recordings). Re-add a `spawn ".../dictationapp" "--togg
 - Hotkey events pass through to the focused app too (no device grab — grabbing would block
   normal typing). RightCtrl is inert in practice.
 - If several devices report the same key, overlapping holds count as one gesture.
-- `/dev/input/event*` needs read access (user ACL); `/dev/uinput` needs write access.
-  Without them: IPC + pill-click still work; typing degrades to clipboard-only.
+- `/dev/input/event*` needs read access (user ACL); typing needs the compositor's
+  Wayland virtual keyboard protocol, else clipboard-only. `/dev/uinput` is only used
+  by opt-in hardware tests.
+- Chromium truncates keysyms past U+FFFF, so typed emoji arrive mangled there
+  (any keyboard-based typer does this); the clipboard copy is exact.
 - Never leave an alpha-zero idle toplevel mapped: it blocks underlying buttons and steals
   focus on niri, even with an empty Wayland input region. Idle must mean no pill window.
 - GPUI 0.2.2 normally exits when its last Linux window closes. `vendor/gpui` adds an opt-out;

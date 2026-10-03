@@ -33,18 +33,19 @@ fn usage() -> ! {
          --settings open the settings window\n  \
          --reload   re-read config and apply changes\n  \
          --quit     exit the app\n  \
-         --record <secs> <out.wav>\n  \
+         --record <out.wav> [secs]\n  \
                     record from the mic and save a WAV (debug: hear what the model hears)"
     );
     std::process::exit(0);
 }
 
-/// Headless capture test: `dictationapp --record 5 /tmp/out.wav`
-fn record_wav(secs: f32, out: &str, mic: Option<&str>) -> anyhow::Result<()> {
+/// Headless capture test: `dictationapp --record /tmp/out.wav 5`
+fn record_wav(duration: std::time::Duration, out: &str, mic: Option<&str>) -> anyhow::Result<()> {
+    let secs = duration.as_secs_f32();
     eprintln!("recording {secs:.1}s — speak now");
     let rec = audio::start(mic)?;
-    std::thread::sleep(std::time::Duration::from_secs_f32(secs));
-    let (samples, rate) = rec.finish();
+    std::thread::sleep(duration);
+    let (samples, rate) = rec.finish()?;
     let peak = samples.iter().fold(0.0f32, |a, &s| a.max(s.abs()));
     let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len().max(1) as f32).sqrt();
     eprintln!(
@@ -58,17 +59,28 @@ fn record_wav(secs: f32, out: &str, mic: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn recording_duration(seconds: Option<&str>) -> anyhow::Result<std::time::Duration> {
+    let Some(seconds) = seconds else {
+        return Ok(std::time::Duration::from_secs(5));
+    };
+    let seconds: f32 = seconds.parse()?;
+    Ok(std::time::Duration::try_from_secs_f32(seconds)?)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(arg) = args.get(1) {
         if arg == "--record" || arg == "record" {
-            let secs: f32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(5.0);
             let Some(out) = args.get(2).map(String::as_str) else {
                 eprintln!("usage: dictationapp --record <out.wav> [secs]");
                 std::process::exit(2);
             };
-            let mic = config::Config::load().ok().and_then(|c| c.mic);
-            if let Err(e) = record_wav(secs, out, mic.as_deref()) {
+            let result = (|| -> anyhow::Result<()> {
+                let duration = recording_duration(args.get(3).map(String::as_str))?;
+                let config = config::Config::load()?;
+                record_wav(duration, out, config.mic.as_deref())
+            })();
+            if let Err(e) = result {
                 eprintln!("record failed: {e:#}");
                 std::process::exit(1);
             }
@@ -102,14 +114,17 @@ fn main() {
     // Command channel shared by the IPC socket and the evdev hotkey listener.
     let (tx, rx) = channel::<Command>();
 
-    match ipc::listen(tx.clone()) {
-        Ok(path) => eprintln!("ipc: listening on {}", path.display()),
+    let server = match ipc::listen(tx.clone()) {
+        Ok(server) => {
+            eprintln!("ipc: listening on {}", server.path().display());
+            server
+        }
         Err(e) => {
             eprintln!("{e:#}");
             eprintln!("is another dictationapp already running?");
             std::process::exit(1);
         }
-    }
+    };
 
     // Global hotkey via evdev (needs read access to /dev/input/event*).
     let watcher = match hotkey::parse_key(&config.hotkey) {
@@ -133,7 +148,7 @@ fn main() {
         }
     };
 
-    // Virtual keyboard for typing into the focused window.
+    // Unicode text delivery through the compositor's virtual keyboard protocol.
     let typer = if config.type_text {
         match typer::Typer::new() {
             Ok(t) => Some(t),
@@ -159,4 +174,22 @@ fn main() {
         let view = cx.new(|cx| DictationView::new(config.clone(), rx, tx2, typer, watcher, cx));
         cx.set_global(DictationApp { _view: view });
     });
+    beep::shutdown();
+    // Release the single-instance lock only after the app has stopped.
+    drop(server);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn invalid_recording_duration_fails_before_opening_the_microphone() {
+        assert_eq!(super::recording_duration(None).unwrap().as_secs(), 5);
+        assert_eq!(
+            super::recording_duration(Some("0.25")).unwrap().as_millis(),
+            250
+        );
+        for invalid in ["bad", "-1", "NaN", "inf"] {
+            assert!(super::recording_duration(Some(invalid)).is_err());
+        }
+    }
 }

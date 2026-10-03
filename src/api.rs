@@ -69,7 +69,7 @@ fn cleanup_body(model: &str, transcript: &str, language: Option<&str>) -> serde_
             }
         ],
         "temperature": 0.0,
-        "max_tokens": (transcript.chars().count() * 2).clamp(64, 2048),
+        "max_tokens": transcript.chars().count().saturating_mul(2).clamp(64, 2048),
     })
 }
 
@@ -89,6 +89,34 @@ fn validate_cleanup(raw: &str, candidate: &str) -> Result<String> {
     Ok(candidate.to_string())
 }
 
+fn cleanup_response(transcript: &str, json: &serde_json::Value) -> Result<String> {
+    if let Some(error) = json.get("error").filter(|error| !error.is_null()) {
+        return Err(anyhow!("cleanup provider error: {error}"));
+    }
+    let choice = &json["choices"][0];
+    // Partial or filtered output can still pass the text-length check. Only a
+    // completed answer is eligible to replace the raw transcript.
+    if choice["finish_reason"].as_str() != Some("stop") {
+        return Err(anyhow!(
+            "cleanup did not complete: {}",
+            choice["finish_reason"]
+        ));
+    }
+    if let Some(error) = choice.get("error").filter(|error| !error.is_null()) {
+        return Err(anyhow!("cleanup choice error: {error}"));
+    }
+    let message = &choice["message"];
+    if message.get("refusal").is_some_and(|refusal| {
+        !refusal.is_null() && refusal.as_str().is_none_or(|text| !text.is_empty())
+    }) {
+        return Err(anyhow!("cleanup returned a refusal"));
+    }
+    let text = message["content"]
+        .as_str()
+        .ok_or_else(|| anyhow!("cleanup response missing message content: {json}"))?;
+    validate_cleanup(transcript, text)
+}
+
 pub fn cleanup(
     api_key: &str,
     model: &str,
@@ -106,10 +134,7 @@ pub fn cleanup(
         .body_mut()
         .read_json()
         .context("failed to read cleanup response")?;
-    let text = json["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or_else(|| anyhow!("cleanup response missing message content: {json}"))?;
-    validate_cleanup(transcript, text)
+    cleanup_response(transcript, &json)
 }
 
 #[cfg(test)]
@@ -149,5 +174,33 @@ mod tests {
         assert!(validate_cleanup("hi", "   ").is_err());
         assert!(validate_cleanup("hi", "```hello```").is_err());
         assert!(validate_cleanup("hi", &"x".repeat(500)).is_err());
+    }
+
+    #[test]
+    fn cleanup_rejects_truncated_filtered_and_failed_answers() {
+        let raw = "word ".repeat(3000);
+        let prefix: String = raw.chars().take(8000).collect();
+        assert!(validate_cleanup(&raw, &prefix).is_ok());
+        for reason in ["length", "content_filter", "error", "tool_calls"] {
+            let response = json!({
+                "choices": [{"finish_reason": reason, "message": {"content": prefix}}]
+            });
+            assert!(cleanup_response(&raw, &response).is_err(), "{reason}");
+        }
+        let response = json!({"choices": [{"message": {"content": prefix}}]});
+        assert!(cleanup_response(&raw, &response).is_err());
+    }
+
+    #[test]
+    fn cleanup_accepts_only_completed_non_refused_answers() {
+        let mut response = json!({
+            "choices": [{"finish_reason": "stop", "message": {"content": "Hello."}}]
+        });
+        assert_eq!(cleanup_response("hello", &response).unwrap(), "Hello.");
+        response["error"] = json!({"message": "provider failed"});
+        assert!(cleanup_response("hello", &response).is_err());
+        response["error"] = serde_json::Value::Null;
+        response["choices"][0]["message"]["refusal"] = json!("Cannot comply");
+        assert!(cleanup_response("hello", &response).is_err());
     }
 }

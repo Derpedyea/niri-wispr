@@ -22,7 +22,7 @@ hotkey keeps working without an invisible window intercepting clicks or focus.
    capitalization, and obvious recognition errors without touching your
    meaning. If it fails, the raw transcript is used instead.
 4. **Delivery** — the result is typed into the focused window through a
-   `uinput` virtual keyboard and also placed on the clipboard, so nothing is
+   Unicode Wayland virtual keyboard and also placed on the clipboard, so nothing is
    lost if a field refuses synthetic input.
 
 ## Install
@@ -55,13 +55,13 @@ spawn-at-startup "~/.cargo/bin/dictationapp"
 - **An OpenRouter API key** — set it in the settings window, in
   `config.toml`, or via `OPENROUTER_API_KEY`
 - **Read access to `/dev/input/event*`** — for the global hotkey
-- **Write access to `/dev/uinput`** — for typing; without it the app falls
-  back to clipboard-only
+- **A compositor supporting the Wayland virtual keyboard protocol** (niri,
+  sway, Hyprland, …) — for Unicode text insertion
 - **`pw-play`, `paplay`, or `aplay`** — for the start/stop cues (any one of
   them; `beeps = false` silences this entirely)
 - A microphone reachable through cpal's default input device
 
-Granting `/dev/input` and `/dev/uinput` access is distro-specific — typically
+Granting `/dev/input` access is distro-specific — typically
 the `input` group plus a udev rule, or logind ACLs.
 
 ## Usage
@@ -116,6 +116,10 @@ cleanup_model = "inclusionai/ling-3.0-flash"
 - **`hold`** — press and hold the hotkey; release to transcribe.
 - **`toggle`** — tap once to start, again to stop.
 
+Output changes apply immediately, including transcripts still processing.
+Disabling typing stops any remaining insertion and keeps the full transcript
+on the clipboard. Changing the hotkey or mode discards an active recording.
+
 In hold mode, taps under ¼ second are ignored. In either mode, using the
 hotkey in a shortcut (Right Ctrl+C) never starts a dictation.
 
@@ -164,8 +168,9 @@ binds {
 
 ## Troubleshooting
 
-- **Nothing types** — check `/dev/uinput` write access. Transcripts still
-  reach the clipboard; `type_text = false` silences the startup warning.
+- **Nothing types** — check that your compositor supports the Wayland
+  virtual keyboard protocol. Transcripts still reach the clipboard;
+  `type_text = false` silences the startup warning.
 - **Hotkey does nothing** — check read access to `/dev/input/event*`. IPC
   (`--toggle`, clicking a visible pill) works regardless. The watcher picks
   up newly connected devices within about a second.
@@ -221,8 +226,9 @@ release still happens.
 
 ```bash
 cargo build                    # debug binary at target/debug/dictationapp
-cargo test                     # unit tests
-cargo test -- --ignored        # network test (needs OPENROUTER_API_KEY + /tmp/speech.wav)
+cargo test                     # deterministic tests; no desktop input
+cargo test -- --ignored        # opt-in hardware/input + network tests
+python3 scripts/test-aur-publish.py  # mocked publishing; no network or credentials
 ```
 
 Rust + [gpui](https://github.com/zed-industries/zed) (UI), cpal (audio),
@@ -240,8 +246,8 @@ and [docs/window-lifecycle.md](docs/window-lifecycle.md) for native verification
 | `audio.rs` | mic capture + WAV encode |
 | `api.rs` | OpenRouter transcription + cleanup pass |
 | `hotkey.rs` | evdev global hotkey watcher |
-| `typer.rs` | uinput virtual keyboard |
-| `ipc.rs` | Unix socket for CLI commands |
+| `typer.rs` | Unicode insertion through a Wayland virtual keyboard |
+| `ipc.rs` | Ordered CLI commands, acknowledgements, and lifetime-held instance lock |
 | `settings.rs` | settings window |
 | `beep.rs` | audio cues |
 | `niri.rs` | pill positioning via `niri msg` |

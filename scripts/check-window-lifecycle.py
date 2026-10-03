@@ -2,6 +2,7 @@
 """Check real window lifetime in an isolated headless niri session."""
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -60,6 +61,11 @@ def nested(binary, state):
                     if w["pid"] == app.pid and w["title"] == title]
 
         wait_for("IPC ready", lambda: bool(list(runtime.glob("dictationapp-*.sock"))))
+        executable = Path(f"/proc/{app.pid}/exe")
+        digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+        assert executable.resolve() == Path(binary).resolve(), "Wrong binary is running"
+        assert digest == (state / "binary.sha256").read_text(), "Running binary changed"
+        report("PASS executing test binary sha256=" + digest)
         command("--reload")
         wait_for("command pump ready", lambda: "handling Reload" in log_path.read_text())
         assert not windows("Dictation"), "Idle Dictation leaves a native window mapped"
@@ -106,8 +112,11 @@ def main():
     assert binary.is_file(), f"Build the binary first: {binary}"
     for tool in ("niri", "gamescope"):
         assert shutil.which(tool), f"Missing test dependency: {tool}"
-    with tempfile.TemporaryDirectory(prefix="dictation-window-check-") as directory:
+    # Unix sockets have a short path limit; orchestration can override TMPDIR
+    # with a directory too long for the app's isolated IPC socket.
+    with tempfile.TemporaryDirectory(prefix="dictation-window-check-", dir="/tmp") as directory:
         state = Path(directory)
+        (state / "binary.sha256").write_text(hashlib.sha256(binary.read_bytes()).hexdigest())
         config = state / "niri.kdl"
         config.write_text('''
 hotkey-overlay { skip-at-startup; }
