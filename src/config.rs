@@ -165,23 +165,34 @@ fn cleanup_interrupted_saves(parent: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Preserve a user's dotfile symlink: replace its target, not the link itself.
+/// The target need not exist yet, so the first save through a link creates it.
+fn resolve_symlinks(path: &Path) -> Result<PathBuf> {
+    let mut path = path.to_path_buf();
+    // The kernel's own limit for symlink chains.
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target =
+                    std::fs::read_link(&path).context("failed to read the config symlink")?;
+                // join keeps an absolute target as is.
+                path = path.parent().unwrap_or(Path::new("")).join(target);
+            }
+            Ok(_) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+            Err(error) => return Err(error).context("failed to inspect the config destination"),
+        }
+    }
+    anyhow::bail!("too many levels of config symlinks")
+}
+
 /// The write callback makes partial I/O failures testable without filling a disk.
 fn replace_config(path: &Path, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<()> {
     let _guard = CONFIG_SAVE_LOCK
         .lock()
         .map_err(|_| anyhow::anyhow!("config save lock was poisoned"))?;
-    // Preserve a user's dotfile symlink: replace its target, not the link itself.
-    let resolved;
-    let path = match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            resolved =
-                std::fs::canonicalize(path).context("failed to resolve the config symlink")?;
-            resolved.as_path()
-        }
-        Ok(_) => path,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => path,
-        Err(error) => return Err(error).context("failed to inspect the config destination"),
-    };
+    let resolved = resolve_symlinks(path)?;
+    let path = resolved.as_path();
     let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -354,6 +365,23 @@ mod tests {
         let path = directory.path().join("config.toml");
         std::fs::write(&target, "old").unwrap();
         std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        replace_config(&path, |file| file.write_all(b"new")).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+    }
+
+    #[test]
+    fn first_save_through_a_dangling_symlink_creates_its_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("dotfiles/dictationapp.toml");
+        let path = directory.path().join("config.toml");
+        std::os::unix::fs::symlink("dotfiles/dictationapp.toml", &path).unwrap();
 
         replace_config(&path, |file| file.write_all(b"new")).unwrap();
         assert!(
