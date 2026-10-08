@@ -494,4 +494,32 @@ mod tests {
             .type_str(&text, &AtomicBool::new(false))
             .unwrap();
     }
+
+    /// Exercises the target client's real Wayland clipboard request; never
+    /// invoke outside scripts/check-delivery.py's isolated compositor.
+    #[test]
+    #[ignore]
+    fn pastes_into_focused_window() {
+        assert!(std::env::var_os("DICTATION_TEST_PASTE").is_some());
+        let mut session = Session::connect().unwrap();
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            "evdev",
+            "pc105",
+            "us",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .unwrap();
+        let control = 1 << keymap.mod_get_index("Control");
+        session
+            .keymap(&keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1))
+            .unwrap();
+        session.keyboard.modifiers(control, 0, 0, 0);
+        session.tap(47).unwrap(); // US V
+        session.keyboard.modifiers(0, 0, 0, 0);
+        session.link.settle().unwrap();
+    }
 }
