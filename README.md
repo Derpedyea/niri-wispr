@@ -57,6 +57,8 @@ spawn-at-startup "~/.cargo/bin/dictationapp"
 - **Read access to `/dev/input/event*`** — for the global hotkey
 - **A compositor supporting the Wayland virtual keyboard protocol** (niri,
   sway, Hyprland, …) — for Unicode text insertion
+- **`wl-clipboard`** — publishes transcripts without focusing the pill; niri's
+  data-control protocol lets the intended text field keep focus
 - **`pw-play`, `paplay`, or `aplay`** — for the start/stop cues (any one of
   them; `beeps = false` silences this entirely)
 - A microphone reachable through cpal's default input device
@@ -121,6 +123,8 @@ cleanup_model = "inclusionai/ling-3.0-flash"
 Output changes apply immediately, including transcripts still processing.
 Disabling typing stops any remaining insertion and keeps the full transcript
 on the clipboard. Changing the hotkey or mode discards an active recording.
+Clipboard-only completion briefly shows **Copied. Paste to insert.** A failed
+clipboard copy stops delivery and shows **Copy failed. Check wl-clipboard.**
 
 In hold mode, taps under ¼ second are ignored. In either mode, using the
 hotkey in a shortcut (Right Ctrl+C) never starts a dictation.
@@ -173,6 +177,8 @@ binds {
 - **Nothing types** — check that your compositor supports the Wayland
   virtual keyboard protocol. Transcripts still reach the clipboard;
   `type_text = false` silences the startup warning.
+- **Copy failed** — install `wl-clipboard` and check the Wayland session, then
+  dictate again. This also supplies the fallback copy if typing fails.
 - **Hotkey does nothing** — check read access to `/dev/input/event*`. IPC
   (`--toggle`, clicking a visible pill) works regardless. The watcher picks
   up newly connected devices within about a second.

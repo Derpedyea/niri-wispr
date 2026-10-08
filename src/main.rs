@@ -2,6 +2,7 @@ mod api;
 mod app;
 mod audio;
 mod beep;
+mod clipboard;
 mod config;
 mod hotkey;
 mod ipc;

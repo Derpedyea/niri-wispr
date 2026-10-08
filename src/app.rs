@@ -4,11 +4,11 @@ use crate::hotkey::Watcher;
 use crate::ipc::Command;
 use crate::tray::{self, Tray};
 use crate::typer::Typer;
-use crate::{api, audio, beep, hotkey, niri, settings};
+use crate::{api, audio, beep, clipboard, hotkey, niri, settings};
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, MouseButton,
-    MouseDownEvent, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowHandle, WindowOptions, div, prelude::*, px, rgb, rgba, size,
+    App, Bounds, Context, Entity, FocusHandle, Focusable, MouseButton, MouseDownEvent,
+    SharedString, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
+    WindowOptions, div, prelude::*, px, rgb, rgba, size,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -30,6 +30,7 @@ pub enum Status {
     },
     Transcribing,
     Cleaning,
+    Copying,
     Typing,
 }
 
@@ -41,7 +42,7 @@ impl Status {
     fn is_delivering(&self) -> bool {
         matches!(
             self,
-            Status::Transcribing | Status::Cleaning | Status::Typing
+            Status::Transcribing | Status::Cleaning | Status::Copying | Status::Typing
         )
     }
 }
@@ -79,6 +80,7 @@ pub struct DictationView {
     watcher: Option<Watcher>,
     /// Shared with the delivery child; settings changes and every shutdown stop it.
     typing_cancel: Option<Arc<AtomicBool>>,
+    copy_cancel: Option<Arc<AtomicBool>>,
     /// A start (hold press, `--start`, or toggle) that arrived while the last
     /// transcript was still being delivered. It records once idle, unless its
     /// gesture ends first — dropping it would lose speech; replaying it alone
@@ -123,6 +125,7 @@ impl DictationView {
             typer: typer.map(|t| Arc::new(Mutex::new(t))),
             watcher,
             typing_cancel: None,
+            copy_cancel: None,
             start_pending: false,
             shutting_down: false,
             tray,
@@ -206,7 +209,7 @@ impl DictationView {
                 Status::Recording { .. } => self.stop_and_transcribe(cx),
                 Status::Idle => self.start_recording(),
                 Status::StartFailed { error, .. } => self.show_start_failure(error),
-                Status::Transcribing | Status::Cleaning | Status::Typing => {
+                Status::Transcribing | Status::Cleaning | Status::Copying | Status::Typing => {
                     self.start_pending = !self.start_pending;
                 }
             },
@@ -352,10 +355,17 @@ impl DictationView {
         }
     }
 
+    fn cancel_copy(&mut self) {
+        if let Some(cancelled) = &self.copy_cancel {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
+
     fn prepare_quit(&mut self) {
         self.shutting_down = true;
         self.cancel_recording();
         self.cancel_typing();
+        self.cancel_copy();
         self.typer = None;
         if let Some(mut watcher) = self.watcher.take()
             && let Err(error) = watcher.stop()
@@ -584,12 +594,33 @@ impl DictationView {
                 raw
             };
 
-            // Always stash in the clipboard as a fallback.
+            this.update(cx, |view, cx| view.deliver_transcript(text, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Publish before insertion. Commands remain live while wl-copy is waiting
+    /// on the compositor; output changes are applied again after publication.
+    fn deliver_transcript(&mut self, text: String, cx: &mut Context<Self>) {
+        self.drain_commands(cx);
+        if self.shutting_down {
+            return;
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.copy_cancel = Some(cancelled.clone());
+        self.status = Status::Copying;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let copy_text = text.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { clipboard::copy(&copy_text, &cancelled) })
+                .await;
             let delivery = this
-                .update(cx, |view, cx| view.prepare_delivery(&text, cx))
+                .update(cx, |view, cx| view.prepare_delivery(result, cx))
                 .ok()
                 .flatten();
-
             if let Some(Delivery { typer, cancelled }) = delivery {
                 let text2 = text.clone();
                 let n = text2.chars().count();
@@ -615,9 +646,10 @@ impl DictationView {
                                 eprintln!("typed {n} chars");
                                 view.clear_message();
                             }
-                            Err(e) => view.show_error(format!(
-                                "Typing failed ({e:#}) — transcript is on the clipboard"
-                            )),
+                            Err(e) => {
+                                eprintln!("typing: {e:#}");
+                                view.show_error("Typing failed. Full text copied.");
+                            }
                         }
                     }
                     cx.notify();
@@ -628,15 +660,27 @@ impl DictationView {
         .detach();
     }
 
-    fn prepare_delivery(&mut self, text: &str, cx: &mut Context<Self>) -> Option<Delivery> {
+    fn prepare_delivery(
+        &mut self,
+        copied: anyhow::Result<()>,
+        cx: &mut Context<Self>,
+    ) -> Option<Delivery> {
         // Save may have queued Reload while the periodic pump is still waiting
         // for its next tick. Apply it before choosing clipboard-only vs typing.
         self.drain_commands(cx);
         if self.shutting_down {
             return None;
         }
-        cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
-        let delivery = self.begin_delivery();
+        self.copy_cancel = None;
+        let delivery = match copied {
+            Ok(()) => self.begin_delivery(),
+            Err(error) => {
+                eprintln!("clipboard: {error:#}");
+                self.finish_delivery();
+                self.show_error("Copy failed. Check wl-clipboard.");
+                None
+            }
+        };
         cx.notify();
         delivery
     }
@@ -649,7 +693,7 @@ impl DictationView {
             self.status = Status::Typing;
             Some(Delivery { typer, cancelled })
         } else {
-            self.clear_message();
+            self.show_notice("Copied. Paste to insert.");
             self.finish_delivery();
             None
         }
@@ -771,6 +815,7 @@ impl DictationView {
             }
             Status::Transcribing => "Transcribing".to_string(),
             Status::Cleaning => "Refining".to_string(),
+            Status::Copying => "Copying".to_string(),
             Status::Typing => "Inserting".to_string(),
             Status::Idle | Status::StartFailed { .. } => String::new(),
         }
@@ -786,7 +831,7 @@ impl DictationView {
                 }
             }
             Status::Recording { .. } => 0xff5f57,
-            Status::Transcribing | Status::Cleaning | Status::Typing => 0x8da2fb,
+            Status::Transcribing | Status::Cleaning | Status::Copying | Status::Typing => 0x8da2fb,
         }
     }
 }
@@ -794,6 +839,7 @@ impl DictationView {
 impl Drop for DictationView {
     fn drop(&mut self) {
         self.cancel_typing();
+        self.cancel_copy();
     }
 }
 
@@ -941,6 +987,91 @@ mod tests {
     }
 
     #[gpui::test]
+    fn clipboard_only_completion_is_visible_and_failed_copy_never_types(cx: &mut TestAppContext) {
+        let view = view(cx, true);
+        view.update(cx, |view, cx| {
+            view.status = Status::Copying;
+            assert!(
+                view.prepare_delivery(Err(anyhow::anyhow!("publisher failed")), cx)
+                    .is_none()
+            );
+            assert!(matches!(view.status, Status::Idle));
+            assert!(view.typing_cancel.is_none());
+            assert_eq!(
+                view.error.as_deref(),
+                Some("Copy failed. Check wl-clipboard.")
+            );
+            assert!(view.notice.is_none());
+
+            for type_text in [false, true] {
+                view.config.type_text = type_text;
+                view.typer = None;
+                view.status = Status::Copying;
+                assert!(view.prepare_delivery(Ok(()), cx).is_none());
+                assert!(matches!(view.status, Status::Idle));
+                assert_eq!(view.notice.as_deref(), Some("Copied. Paste to insert."));
+                assert!(view.error.is_none());
+                assert!(view.pill_visible());
+                view.clear_message();
+                assert!(!view.pill_visible());
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn shutdown_and_drop_cancel_the_clipboard_publisher(cx: &mut TestAppContext) {
+        for shutdown in [false, true] {
+            let view = view(cx, false);
+            let cancelled = view.update(cx, |view, cx| {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                view.copy_cancel = Some(cancelled.clone());
+                view.status = Status::Copying;
+                if shutdown {
+                    view.prepare_quit();
+                    assert!(view.prepare_delivery(Ok(()), cx).is_none());
+                    assert!(view.notice.is_none());
+                }
+                cancelled
+            });
+            drop(view);
+            cx.update(|_| {});
+            assert!(cancelled.load(Ordering::Acquire));
+        }
+    }
+
+    /// Real GPUI/Wayland fixture, driven only by the isolated niri script.
+    /// Injects a completed transcript instead of microphone/network I/O.
+    #[test]
+    #[ignore]
+    fn native_delivery_fixture() {
+        eprintln!("fixture: reliable clipboard publication");
+        let text = std::env::var("DICTATION_TEST_TRANSCRIPT").expect("use check-delivery.py");
+        let trigger = PathBuf::from(std::env::var_os("DICTATION_TEST_TRIGGER").unwrap());
+        let config = Config::load().unwrap();
+        let (tx, rx) = channel();
+        let server = crate::ipc::listen(tx.clone()).unwrap();
+        let typer = config.type_text.then(|| Typer::new().unwrap());
+        gpui::Application::new().run(move |cx| {
+            cx.set_quit_on_last_window_close(false);
+            let view = cx.new(|cx| DictationView::new(config, rx, tx, typer, None, None, cx));
+            cx.set_global(crate::DictationApp {
+                _view: view.clone(),
+            });
+            cx.spawn(async move |cx| {
+                while !trigger.exists() {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(20))
+                        .await;
+                }
+                view.update(cx, |view, cx| view.deliver_transcript(text, cx))
+                    .unwrap();
+            })
+            .detach();
+        });
+        drop(server);
+    }
+
+    #[gpui::test]
     fn output_reload_applies_to_pending_and_active_delivery(cx: &mut TestAppContext) {
         let view = view(cx, true);
         view.update(cx, |view, _| {
@@ -1078,7 +1209,7 @@ mod tests {
         view.update(cx, |view, cx| {
             view.status = Status::Transcribing;
             view.tx.send(Command::Start).unwrap();
-            assert!(view.prepare_delivery("done", cx).is_none());
+            assert!(view.prepare_delivery(Ok(()), cx).is_none());
             // No API key in tests, so a handled Start reaches StartFailed.
             assert!(matches!(view.status, Status::StartFailed { .. }));
         });
@@ -1090,7 +1221,7 @@ mod tests {
         view.update(cx, |view, cx| {
             view.status = Status::Transcribing;
             view.tx.send(Command::Start).unwrap();
-            assert!(view.prepare_delivery("done", cx).is_some());
+            assert!(view.prepare_delivery(Ok(()), cx).is_some());
             assert!(matches!(view.status, Status::Typing));
             view.drain_commands(cx);
             view.finish_delivery();
@@ -1148,13 +1279,9 @@ mod tests {
                 view.status = Status::Transcribing;
                 view.tx.send(Command::Reload).unwrap();
                 // Simulate completion before the pump's next timer tick.
-                let text = "Café — full pending transcript";
-                assert!(view.prepare_delivery(text, cx).is_none());
+                assert!(view.prepare_delivery(Ok(()), cx).is_none());
                 assert!(!view.config.type_text);
-                assert_eq!(
-                    cx.read_from_clipboard().unwrap().text().as_deref(),
-                    Some(text)
-                );
+                assert_eq!(view.notice.as_deref(), Some("Copied. Paste to insert."));
             });
             return;
         }

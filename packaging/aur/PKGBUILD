@@ -17,6 +17,7 @@ depends=(
   'libxkbcommon-x11'
   'wayland'
   'fontconfig'
+  'wl-clipboard'
 )
 makedepends=('cargo' 'pkgconf')
 optdepends=(
