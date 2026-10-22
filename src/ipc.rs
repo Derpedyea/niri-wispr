@@ -35,6 +35,9 @@ pub enum Command {
     Settings,
     /// Re-read config.toml and apply changes (restarts the hotkey watcher if needed).
     Reload,
+    /// Internal: work finished off the command loop or a window reported
+    /// something; wakes the loop to handle it. Never sent over the socket.
+    Wake,
     /// Internal events are tied to the watcher that produced them.
     Hotkey {
         generation: u64,
@@ -77,6 +80,7 @@ impl Command {
             Command::Settings => Ok("settings"),
             Command::Reload => Ok("reload"),
             Command::Hotkey { .. } => anyhow::bail!("hotkey events cannot be sent over IPC"),
+            Command::Wake => anyhow::bail!("wake is internal"),
         }
     }
 }

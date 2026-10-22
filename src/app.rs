@@ -4,14 +4,10 @@ use crate::hotkey::Watcher;
 use crate::ipc::Command;
 use crate::tray::{self, Tray};
 use crate::typer::Typer;
-use crate::{api, audio, beep, clipboard, hotkey, niri, settings};
-use gpui::{
-    App, Bounds, Context, Entity, FocusHandle, Focusable, MouseButton, MouseDownEvent,
-    SharedString, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
-    WindowOptions, div, prelude::*, px, rgb, rgba, size,
-};
+use crate::{api, audio, beep, clipboard, hotkey, settings, ui};
+use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -50,6 +46,8 @@ impl Status {
 const BAR_COUNT: usize = 21;
 const ERROR_DURATION: Duration = Duration::from_secs(4);
 const NOTICE_DURATION: Duration = Duration::from_millis(2500);
+/// How often capture, cues, the waveform and messages are checked.
+const TICK: Duration = Duration::from_millis(40);
 
 fn normalize_level(level: f32) -> f32 {
     ((level - 0.02) / 0.55).clamp(0.0, 1.0).powf(0.7)
@@ -66,9 +64,49 @@ fn push_waveform(history: &mut [f32; BAR_COUNT], smoothed: &mut f32, level: f32)
     history[BAR_COUNT - 1] = *smoothed;
 }
 
-pub struct DictationView {
-    focus_handle: FocusHandle,
-    window: Option<WindowHandle<Self>>,
+/// Results of work done off the command loop. Each is followed by a
+/// `Command::Wake` so the loop handles it at once.
+enum Internal {
+    Transcribed {
+        result: anyhow::Result<String>,
+        cleanup: Option<Cleanup>,
+    },
+    /// The text to deliver, cleaned up or not.
+    Text(String),
+    Copied {
+        result: anyhow::Result<()>,
+        text: String,
+    },
+    Typed {
+        outcome: anyhow::Result<()>,
+        cancelled: Arc<AtomicBool>,
+        chars: usize,
+    },
+}
+
+/// Cleanup settings as they were when the recording stopped.
+struct Cleanup {
+    api_key: String,
+    model: String,
+    language: Option<String>,
+}
+
+/// What the pill window draws; see `ui/src/pill.tsx`.
+#[derive(Serialize)]
+struct PillView {
+    dot: String,
+    kind: &'static str,
+    bars: Vec<f32>,
+    label: String,
+    message: String,
+}
+
+pub struct Dictation {
+    /// The pill's window process, while one is wanted.
+    pill: Option<ui::Window>,
+    /// The pill process failed or quit while wanted; retried once idle.
+    pill_failed: bool,
+    settings: Option<settings::Session>,
     config: Config,
     status: Status,
     recording: Option<Recording>,
@@ -76,6 +114,8 @@ pub struct DictationView {
     notice: Option<String>,
     rx: Receiver<Command>,
     tx: Sender<Command>,
+    internal_rx: Receiver<Internal>,
+    internal_tx: Sender<Internal>,
     typer: Option<Arc<Mutex<Typer>>>,
     watcher: Option<Watcher>,
     /// Shared with the delivery child; settings changes and every shutdown stop it.
@@ -93,8 +133,6 @@ pub struct DictationView {
     waveform: [f32; BAR_COUNT],
     smoothed_level: f32,
     message_expires_at: Option<Instant>,
-    /// Free-running animation phase, advanced by the pump.
-    anim: f32,
 }
 
 struct Delivery {
@@ -102,7 +140,7 @@ struct Delivery {
     cancelled: Arc<AtomicBool>,
 }
 
-impl DictationView {
+impl Dictation {
     pub fn new(
         config: Config,
         rx: Receiver<Command>,
@@ -110,11 +148,12 @@ impl DictationView {
         typer: Option<Typer>,
         watcher: Option<Watcher>,
         tray: Option<Tray>,
-        cx: &mut Context<Self>,
     ) -> Self {
-        let view = Self {
-            focus_handle: cx.focus_handle(),
-            window: None,
+        let (internal_tx, internal_rx) = channel();
+        Self {
+            pill: None,
+            pill_failed: false,
+            settings: None,
             config,
             status: Status::Idle,
             recording: None,
@@ -122,6 +161,8 @@ impl DictationView {
             notice: None,
             rx,
             tx,
+            internal_rx,
+            internal_tx,
             typer: typer.map(|t| Arc::new(Mutex::new(t))),
             watcher,
             typing_cancel: None,
@@ -133,68 +174,69 @@ impl DictationView {
             waveform: [0.0; BAR_COUNT],
             smoothed_level: 0.0,
             message_expires_at: None,
-            anim: 0.0,
-        };
-        cx.on_app_quit(|view, _| {
-            view.prepare_quit();
-            async {}
-        })
-        .detach();
-        view.start_pump(cx);
-        view
+        }
     }
 
-    /// Poll the command channel and the mic level on a timer.
-    fn start_pump(&self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(40))
-                    .await;
-                let alive = match this.update(cx, |view, cx| {
-                    view.anim += 0.04;
-                    let mut changed = view.drain_commands(cx);
-                    changed |= view.fail_recording_if_needed();
-                    changed |= view.cue_if_due();
-                    view.sync_tray();
-                    if let Some(level) = view.recording.as_ref().map(|rec| rec.capture.level()) {
-                        push_waveform(&mut view.waveform, &mut view.smoothed_level, level);
-                        changed = true;
-                    }
-                    if let Some(deadline) = view.message_expires_at
-                        && Instant::now() >= deadline
-                    {
-                        view.clear_message();
-                        changed = true;
-                    }
-                    // Keep redrawing while animated (waveform decay, busy bars).
-                    if changed || view.status.is_active() {
-                        cx.notify();
-                    }
-                    true
-                }) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("pump update failed: {e}");
-                        false
-                    }
-                };
-                if !alive {
-                    break;
-                }
-                // Opening a window renders its root, so release the view update first.
-                if let Some(view) = this.upgrade()
-                    && let Err(error) = cx.update(|cx| Self::sync_window(&view, cx)).flatten()
-                {
-                    eprintln!("pill window: {error:#}");
-                }
+    /// Handle commands until `Quit`.
+    pub fn run(mut self) {
+        let mut next_tick = Instant::now();
+        while !self.shutting_down {
+            match self
+                .rx
+                .recv_timeout(next_tick.saturating_duration_since(Instant::now()))
+            {
+                Ok(command) => self.handle_command(command),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
             }
-        })
-        .detach();
+            self.drain_commands();
+            // Settings first: a change saved there queues the Reload that a
+            // finishing delivery drains before choosing typing or clipboard.
+            if let Some(session) = &mut self.settings
+                && !session.tick()
+            {
+                self.settings = None;
+            }
+            while !self.shutting_down
+                && let Ok(event) = self.internal_rx.try_recv()
+            {
+                self.handle_internal(event);
+            }
+            if Instant::now() >= next_tick {
+                self.tick();
+                next_tick = Instant::now() + TICK;
+            }
+            self.sync_pill();
+        }
     }
 
-    fn handle_command(&mut self, cmd: Command, cx: &mut Context<Self>) {
-        if self.shutting_down {
+    fn tick(&mut self) {
+        self.fail_recording_if_needed();
+        self.cue_if_due();
+        self.sync_tray();
+        if let Some(level) = self.recording.as_ref().map(|rec| rec.capture.level()) {
+            push_waveform(&mut self.waveform, &mut self.smoothed_level, level);
+        }
+        if let Some(deadline) = self.message_expires_at
+            && Instant::now() >= deadline
+        {
+            self.clear_message();
+        }
+    }
+
+    /// Run `work` on its own thread and hand its result back to the loop.
+    fn spawn_work(&self, work: impl FnOnce() -> Internal + Send + 'static) {
+        let internal = self.internal_tx.clone();
+        let wake = self.tx.clone();
+        std::thread::spawn(move || {
+            if internal.send(work()).is_ok() {
+                let _ = wake.send(Command::Wake);
+            }
+        });
+    }
+
+    fn handle_command(&mut self, cmd: Command) {
+        if self.shutting_down || cmd == Command::Wake {
             return;
         }
         eprintln!("handling {cmd:?}");
@@ -202,11 +244,11 @@ impl DictationView {
             Command::Hotkey { generation, action } => {
                 // Stop/join cannot retract commands already queued by an old listener.
                 if self.watcher.as_ref().map(Watcher::generation) == Some(generation) {
-                    self.handle_command(action.into(), cx);
+                    self.handle_command(action.into());
                 }
             }
             Command::Toggle => match self.status {
-                Status::Recording { .. } => self.stop_and_transcribe(cx),
+                Status::Recording { .. } => self.stop_and_transcribe(),
                 Status::Idle => self.start_recording(),
                 Status::StartFailed { error, .. } => self.show_start_failure(error),
                 Status::Transcribing | Status::Cleaning | Status::Copying | Status::Typing => {
@@ -219,24 +261,17 @@ impl DictationView {
                 _ => {}
             },
             Command::Stop => match self.status {
-                Status::Recording { .. } => self.stop_and_transcribe(cx),
+                Status::Recording { .. } => self.stop_and_transcribe(),
                 Status::StartFailed { error, .. } => self.show_start_failure(error),
                 _ => self.start_pending = false,
             },
             Command::Cancel => {
                 self.cancel_recording();
             }
-            Command::Quit => {
-                self.prepare_quit();
-                cx.quit();
-            }
-            Command::Settings => {
-                if let Err(error) = settings::open(cx, self.tx.clone()) {
-                    eprintln!("settings: {error:#}");
-                    self.show_error("Unable to load settings. Check config.toml.");
-                }
-            }
+            Command::Quit => self.prepare_quit(),
+            Command::Settings => self.open_settings(),
             Command::Reload => self.reload_config(),
+            Command::Wake => {}
         }
     }
 
@@ -252,13 +287,35 @@ impl DictationView {
         }
     }
 
-    fn drain_commands(&mut self, cx: &mut Context<Self>) -> bool {
-        let mut changed = false;
+    fn drain_commands(&mut self) {
         while let Ok(command) = self.rx.try_recv() {
-            self.handle_command(command, cx);
-            changed = true;
+            self.handle_command(command);
         }
-        changed
+    }
+
+    /// Open Settings, or bring the open window forward with fresh values.
+    fn open_settings(&mut self) {
+        if let Some(session) = &mut self.settings {
+            session.reopen();
+            return;
+        }
+        // A failed read must not become an editable default that a save would
+        // persist. File values only: saving never copies OPENROUTER_API_KEY in.
+        let config = match Config::load_file() {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("settings: {error:#}");
+                self.show_error("Unable to load settings. Check config.toml.");
+                return;
+            }
+        };
+        match settings::Session::open(config, self.tx.clone()) {
+            Ok(session) => self.settings = Some(session),
+            Err(error) => {
+                eprintln!("settings: {error:#}");
+                self.show_error("Unable to open settings.");
+            }
+        }
     }
 
     /// Apply output changes before any pending transcript can choose a delivery target.
@@ -374,13 +431,13 @@ impl DictationView {
         }
     }
 
-    fn fail_recording_if_needed(&mut self) -> bool {
+    fn fail_recording_if_needed(&mut self) {
         let Some(error) = self
             .recording
             .as_ref()
             .and_then(|rec| rec.capture.failure())
         else {
-            return false;
+            return;
         };
         eprintln!("recording failed: {error}");
         self.recording = None;
@@ -392,7 +449,6 @@ impl DictationView {
                 error: "Microphone unavailable. Check your input device.",
             };
         }
-        true
     }
 
     fn start_recording(&mut self) {
@@ -436,9 +492,8 @@ impl DictationView {
 
     /// Capture starts at once so no speech is lost, but the beep and pill — or
     /// a start failure — wait until `MIN_HOLD` has passed, so the taps and
-    /// shortcuts the hotkey cancels before then stay invisible. Returns
-    /// whether anything was shown.
-    fn cue_if_due(&mut self) -> bool {
+    /// shortcuts the hotkey cancels before then stay invisible.
+    fn cue_if_due(&mut self) {
         match self.status {
             Status::StartFailed { started, error } if started.elapsed() >= hotkey::MIN_HOLD => {
                 self.show_start_failure(error);
@@ -455,17 +510,12 @@ impl DictationView {
                     beep::start();
                 }
                 self.clear_message();
-                // A recent notice can keep the previous pill open between recordings.
-                if self.window.is_some() {
-                    niri::reposition();
-                }
             }
-            _ => return false,
+            _ => {}
         }
-        true
     }
 
-    fn stop_and_transcribe(&mut self, cx: &mut Context<Self>) {
+    fn stop_and_transcribe(&mut self) {
         let Some(rec) = self.recording.take() else {
             return;
         };
@@ -509,78 +559,100 @@ impl DictationView {
         let api_key = self.config.api_key.clone().unwrap_or_default();
         let model = self.config.model.clone();
         let language = self.config.language.clone();
-        let cleanup_enabled = self.config.cleanup;
-        let cleanup_model = self.config.cleanup_model.clone();
+        let cleanup = self.config.cleanup.then(|| Cleanup {
+            api_key: api_key.clone(),
+            model: self.config.cleanup_model.clone(),
+            language: language.clone(),
+        });
+        self.spawn_work(move || {
+            eprintln!(
+                "transcribe task running ({} bytes wav, model {model})",
+                wav.len()
+            );
+            let result = api::transcribe(&api_key, &model, &wav, language.as_deref());
+            eprintln!(
+                "transcribe returned: {:?}",
+                result.as_ref().map(|t| t.len())
+            );
+            Internal::Transcribed { result, cleanup }
+        });
+    }
 
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn({
-                    let api_key = api_key.clone();
-                    let language = language.clone();
-                    async move {
-                        eprintln!(
-                            "transcribe task running ({} bytes wav, model {model})",
-                            wav.len()
-                        );
-                        let r = api::transcribe(&api_key, &model, &wav, language.as_deref());
-                        eprintln!("transcribe returned: {:?}", r.as_ref().map(|t| t.len()));
-                        r
-                    }
-                })
-                .await;
-
-            match this.update(cx, |view, _| view.shutting_down) {
-                Ok(false) => {}
-                Ok(true) | Err(_) => return,
+    fn handle_internal(&mut self, event: Internal) {
+        match event {
+            Internal::Transcribed { result, cleanup } => self.transcribed(result, cleanup),
+            Internal::Text(text) => self.deliver_transcript(text),
+            Internal::Copied { result, text } => {
+                if let Some(Delivery { typer, cancelled }) = self.prepare_delivery(result) {
+                    let chars = text.chars().count();
+                    let child_cancel = cancelled.clone();
+                    self.spawn_work(move || {
+                        let outcome = match typer.lock() {
+                            Ok(mut typer) => typer.type_str(&text, &child_cancel),
+                            Err(_) => Err(anyhow::anyhow!("typing state poisoned")),
+                        };
+                        Internal::Typed {
+                            outcome,
+                            cancelled,
+                            chars,
+                        }
+                    });
+                }
             }
+            Internal::Typed {
+                outcome,
+                cancelled,
+                chars,
+            } => {
+                self.typing_cancel = None;
+                self.drain_commands();
+                self.finish_delivery();
+                if cancelled.load(Ordering::Acquire) {
+                    self.clear_message();
+                } else {
+                    match outcome {
+                        Ok(()) => {
+                            eprintln!("typed {chars} chars");
+                            self.clear_message();
+                        }
+                        Err(e) => {
+                            eprintln!("typing: {e:#}");
+                            self.show_error("Typing failed. Full text copied.");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-            let raw = match result {
-                Ok(t) if !t.is_empty() => {
-                    eprintln!("transcript: {t:?}");
-                    t
-                }
-                Ok(_) => {
-                    this.update(cx, |view, cx| {
-                        view.drain_commands(cx);
-                        view.finish_delivery();
-                        view.show_notice("No speech detected. Try again.");
-                        cx.notify();
-                    })
-                    .ok();
-                    return;
-                }
-                Err(e) => {
-                    eprintln!("transcription error: {e:#}");
-                    this.update(cx, |view, cx| {
-                        view.drain_commands(cx);
-                        view.finish_delivery();
-                        view.show_error(
-                            "Transcription failed. Check your connection and speech model.",
-                        );
-                        cx.notify();
-                    })
-                    .ok();
-                    return;
-                }
-            };
-
-            let text = if cleanup_enabled {
-                this.update(cx, |view, cx| {
-                    view.status = Status::Cleaning;
-                    cx.notify();
-                })
-                .ok();
-                let cleanup_result =
-                    cx.background_executor()
-                        .spawn({
-                            let raw = raw.clone();
-                            async move {
-                                api::cleanup(&api_key, &cleanup_model, &raw, language.as_deref())
-                            }
-                        })
-                        .await;
-                match cleanup_result {
+    fn transcribed(&mut self, result: anyhow::Result<String>, cleanup: Option<Cleanup>) {
+        let raw = match result {
+            Ok(t) if !t.is_empty() => {
+                eprintln!("transcript: {t:?}");
+                t
+            }
+            Ok(_) => {
+                self.drain_commands();
+                self.finish_delivery();
+                self.show_notice("No speech detected. Try again.");
+                return;
+            }
+            Err(e) => {
+                eprintln!("transcription error: {e:#}");
+                self.drain_commands();
+                self.finish_delivery();
+                self.show_error("Transcription failed. Check your connection and speech model.");
+                return;
+            }
+        };
+        let Some(cleanup) = cleanup else {
+            return self.deliver_transcript(raw);
+        };
+        self.status = Status::Cleaning;
+        self.spawn_work(move || {
+            let language = cleanup.language.as_deref();
+            Internal::Text(
+                match api::cleanup(&cleanup.api_key, &cleanup.model, &raw, language) {
                     Ok(cleaned) => {
                         eprintln!("cleanup applied ({} -> {} chars)", raw.len(), cleaned.len());
                         cleaned
@@ -589,90 +661,36 @@ impl DictationView {
                         eprintln!("cleanup failed, using raw transcript: {e:#}");
                         raw
                     }
-                }
-            } else {
-                raw
-            };
-
-            this.update(cx, |view, cx| view.deliver_transcript(text, cx))
-                .ok();
-        })
-        .detach();
+                },
+            )
+        });
     }
 
     /// Publish before insertion. Commands remain live while wl-copy is waiting
     /// on the compositor; output changes are applied again after publication.
-    fn deliver_transcript(&mut self, text: String, cx: &mut Context<Self>) {
-        self.drain_commands(cx);
+    fn deliver_transcript(&mut self, text: String) {
+        self.drain_commands();
         if self.shutting_down {
             return;
         }
         let cancelled = Arc::new(AtomicBool::new(false));
         self.copy_cancel = Some(cancelled.clone());
         self.status = Status::Copying;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let copy_text = text.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move { clipboard::copy(&copy_text, &cancelled) })
-                .await;
-            let delivery = this
-                .update(cx, |view, cx| view.prepare_delivery(result, cx))
-                .ok()
-                .flatten();
-            if let Some(Delivery { typer, cancelled }) = delivery {
-                let text2 = text.clone();
-                let n = text2.chars().count();
-                let child_cancel = cancelled.clone();
-                let outcome = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let mut typer = typer
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("typing state poisoned"))?;
-                        typer.type_str(&text2, &child_cancel)
-                    })
-                    .await;
-                this.update(cx, |view, cx| {
-                    view.typing_cancel = None;
-                    view.drain_commands(cx);
-                    view.finish_delivery();
-                    if cancelled.load(Ordering::Acquire) {
-                        view.clear_message();
-                    } else {
-                        match outcome {
-                            Ok(()) => {
-                                eprintln!("typed {n} chars");
-                                view.clear_message();
-                            }
-                            Err(e) => {
-                                eprintln!("typing: {e:#}");
-                                view.show_error("Typing failed. Full text copied.");
-                            }
-                        }
-                    }
-                    cx.notify();
-                })
-                .ok();
-            }
-        })
-        .detach();
+        self.spawn_work(move || Internal::Copied {
+            result: clipboard::copy(&text, &cancelled),
+            text,
+        });
     }
 
-    fn prepare_delivery(
-        &mut self,
-        copied: anyhow::Result<()>,
-        cx: &mut Context<Self>,
-    ) -> Option<Delivery> {
-        // Save may have queued Reload while the periodic pump is still waiting
-        // for its next tick. Apply it before choosing clipboard-only vs typing.
-        self.drain_commands(cx);
+    fn prepare_delivery(&mut self, copied: anyhow::Result<()>) -> Option<Delivery> {
+        // Save may have queued Reload that the loop hasn't handled yet. Apply
+        // it before choosing clipboard-only vs typing.
+        self.drain_commands();
         if self.shutting_down {
             return None;
         }
         self.copy_cancel = None;
-        let delivery = match copied {
+        match copied {
             Ok(()) => self.begin_delivery(),
             Err(error) => {
                 eprintln!("clipboard: {error:#}");
@@ -680,9 +698,7 @@ impl DictationView {
                 self.show_error("Copy failed. Check wl-clipboard.");
                 None
             }
-        };
-        cx.notify();
-        delivery
+        }
     }
 
     fn begin_delivery(&mut self) -> Option<Delivery> {
@@ -707,26 +723,6 @@ impl DictationView {
         if std::mem::take(&mut self.start_pending) && !self.shutting_down {
             self.start_recording();
         }
-    }
-
-    fn toggle_action(&mut self, _: &crate::Toggle, _: &mut Window, cx: &mut Context<Self>) {
-        self.handle_command(Command::Toggle, cx);
-        cx.notify();
-    }
-
-    fn cancel_action(&mut self, _: &crate::Cancel, _: &mut Window, cx: &mut Context<Self>) {
-        self.handle_command(Command::Cancel, cx);
-        cx.notify();
-    }
-
-    fn quit_action(&mut self, _: &crate::Quit, _: &mut Window, cx: &mut Context<Self>) {
-        self.prepare_quit();
-        cx.quit();
-    }
-
-    fn on_pill_click(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.handle_command(Command::Toggle, cx);
-        cx.notify();
     }
 
     fn reset_waveform(&mut self) {
@@ -765,46 +761,72 @@ impl DictationView {
         self.shows_status() || self.error.is_some() || self.notice.is_some()
     }
 
-    /// An invisible toplevel still captures focus on niri, even with an empty
-    /// Wayland input region. Only keep a real window while there is a visible pill.
-    fn sync_window(view: &Entity<Self>, cx: &mut App) -> anyhow::Result<()> {
-        if view.read(cx).pill_visible() && view.read(cx).window.is_none() {
-            let root = view.clone();
-            let pill = size(px(300.0), px(64.0));
-            let bounds = Bounds::centered(None, pill, cx);
-            let window = cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Dictation".into()),
-                        appears_transparent: true,
-                        traffic_light_position: None,
-                    }),
-                    window_background: WindowBackgroundAppearance::Transparent,
-                    app_id: Some("dictationapp".to_owned()),
-                    focus: false,
-                    is_resizable: false,
-                    window_min_size: Some(pill),
-                    ..Default::default()
-                },
-                move |window, cx| {
-                    window.set_window_title("Dictation");
-                    window.resize(pill);
-                    window.on_window_should_close(cx, |_, cx| {
-                        cx.quit();
-                        true
-                    });
-                    root
-                },
-            )?;
-            view.update(cx, |view, _| view.window = Some(window));
-            niri::place_at_bottom();
-        } else if !view.read(cx).pill_visible()
-            && let Some(window) = view.update(cx, |view, _| view.window.take())
-        {
-            cx.update_window(window.into(), |_, window, _| window.remove_window())?;
+    /// Idle means no pill process at all: an invisible surface can still take
+    /// clicks or focus. The process starts with capture, so its window is ready
+    /// by the time the recording is cued, and opens with the first view.
+    fn sync_pill(&mut self) {
+        let visible = self.pill_visible();
+        let warm = matches!(
+            self.status,
+            Status::Recording { cued: false, .. } | Status::StartFailed { .. }
+        );
+        if !visible && !warm {
+            self.pill = None;
+            self.pill_failed = false;
+            return;
         }
-        Ok(())
+        if self.pill.as_mut().is_some_and(|pill| !pill.is_open()) {
+            eprintln!("pill: window process exited");
+            self.pill = None;
+            self.pill_failed = true;
+        }
+        if self.pill.is_none() && !self.pill_failed {
+            let tx = self.tx.clone();
+            match ui::Window::spawn("pill", move |event| {
+                if event["event"] == "click" {
+                    let _ = tx.send(Command::Toggle);
+                }
+            }) {
+                Ok(pill) => self.pill = Some(pill),
+                Err(error) => {
+                    eprintln!("pill: {error:#}");
+                    self.pill_failed = true;
+                }
+            }
+        }
+        if visible {
+            let view = self.pill_view();
+            if let Some(pill) = &mut self.pill {
+                pill.show(&view);
+            }
+        }
+    }
+
+    fn pill_view(&self) -> PillView {
+        let recording = matches!(self.status, Status::Recording { .. });
+        let kind = match (self.shows_status(), recording) {
+            (false, _) => "message",
+            (true, true) => "recording",
+            (true, false) => "busy",
+        };
+        PillView {
+            dot: format!("#{:06x}", self.dot_color()),
+            kind,
+            bars: if recording {
+                self.waveform
+                    .iter()
+                    .map(|l| (l * 100.0).round() / 100.0)
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            label: self.status_label(),
+            message: self
+                .error
+                .clone()
+                .or_else(|| self.notice.clone())
+                .unwrap_or_default(),
+        }
     }
 
     fn status_label(&self) -> String {
@@ -836,115 +858,17 @@ impl DictationView {
     }
 }
 
-impl Drop for DictationView {
+impl Drop for Dictation {
     fn drop(&mut self) {
         self.cancel_typing();
         self.cancel_copy();
     }
 }
 
-impl Focusable for DictationView {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl Render for DictationView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.pill_visible() {
-            return div().size_full().bg(rgba(0x00000000));
-        }
-
-        let pill = div()
-            .id("pill")
-            .h(px(56.0))
-            .w_full()
-            .rounded_full()
-            .bg(rgba(0x11141bf2))
-            .border_1()
-            .border_color(rgba(0xffffff22))
-            .px_4()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_3()
-            .cursor_pointer()
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_pill_click))
-            .child(div().size(px(8.0)).rounded_full().bg(rgb(self.dot_color())));
-
-        let pill = if !self.shows_status() {
-            let message = self
-                .error
-                .clone()
-                .or_else(|| self.notice.clone())
-                .unwrap_or_default();
-            pill.child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_sm()
-                    .text_color(rgb(0xf2f4f8))
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .child(SharedString::from(message)),
-            )
-        } else {
-            let recording = matches!(self.status, Status::Recording { .. });
-            pill.child(
-                div()
-                    .flex_1()
-                    .h(px(32.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(2.0))
-                    .children((0..BAR_COUNT).map(|i| {
-                        let h = if recording {
-                            3.0 + self.waveform[i] * 25.0
-                        } else {
-                            3.0 + (((self.anim * 6.0 - i as f32 * 0.55).sin() * 0.5 + 0.5)
-                                .powf(4.0)
-                                * 13.0)
-                        };
-                        div()
-                            .w(px(2.0))
-                            .h(px(h))
-                            .rounded_full()
-                            .bg(rgb(if recording { 0xf1f4fa } else { 0x8da2fb }))
-                    })),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(0xaeb6c5))
-                    .whitespace_nowrap()
-                    .child(self.status_label()),
-            )
-        };
-
-        div()
-            .key_context("Dictation")
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::toggle_action))
-            .on_action(cx.listener(Self::cancel_action))
-            .on_action(cx.listener(Self::quit_action))
-            .flex()
-            .items_center()
-            .justify_center()
-            .size_full()
-            .bg(rgba(0x00000000))
-            .p_1()
-            .child(pill)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
     use std::path::PathBuf;
-    use std::sync::mpsc::channel;
 
     fn config(type_text: bool) -> Config {
         Config {
@@ -971,75 +895,95 @@ mod tests {
         Ok(Watcher::for_test())
     }
 
-    fn view(cx: &mut TestAppContext, type_text: bool) -> Entity<DictationView> {
+    fn view(type_text: bool) -> Dictation {
         let (tx, rx) = channel();
-        cx.new(|cx| {
-            DictationView::new(
-                config(type_text),
-                rx,
-                tx,
-                type_text.then(typer),
-                Some(Watcher::for_test()),
-                None,
-                cx,
-            )
-        })
+        Dictation::new(
+            config(type_text),
+            rx,
+            tx,
+            type_text.then(typer),
+            Some(Watcher::for_test()),
+            None,
+        )
     }
 
-    #[gpui::test]
-    fn clipboard_only_completion_is_visible_and_failed_copy_never_types(cx: &mut TestAppContext) {
-        let view = view(cx, true);
-        view.update(cx, |view, cx| {
+    /// Runs `test` in a child test process whose XDG_CONFIG_HOME holds
+    /// `config_toml`, never the user's configuration.
+    fn in_isolated_config(name: &str, child: &str, config_toml: &str) -> bool {
+        if std::env::var_os(child).is_some() {
+            return true;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("dictationapp")).unwrap();
+        std::fs::write(
+            directory.path().join("dictationapp/config.toml"),
+            config_toml,
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(child, "1")
+            .env("XDG_CONFIG_HOME", directory.path())
+            .env_remove("OPENROUTER_API_KEY")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    #[test]
+    fn clipboard_only_completion_is_visible_and_failed_copy_never_types() {
+        let mut view = view(true);
+        view.status = Status::Copying;
+        assert!(
+            view.prepare_delivery(Err(anyhow::anyhow!("publisher failed")))
+                .is_none()
+        );
+        assert!(matches!(view.status, Status::Idle));
+        assert!(view.typing_cancel.is_none());
+        assert_eq!(
+            view.error.as_deref(),
+            Some("Copy failed. Check wl-clipboard.")
+        );
+        assert!(view.notice.is_none());
+
+        for type_text in [false, true] {
+            view.config.type_text = type_text;
+            view.typer = None;
             view.status = Status::Copying;
-            assert!(
-                view.prepare_delivery(Err(anyhow::anyhow!("publisher failed")), cx)
-                    .is_none()
-            );
+            assert!(view.prepare_delivery(Ok(())).is_none());
             assert!(matches!(view.status, Status::Idle));
-            assert!(view.typing_cancel.is_none());
-            assert_eq!(
-                view.error.as_deref(),
-                Some("Copy failed. Check wl-clipboard.")
-            );
-            assert!(view.notice.is_none());
-
-            for type_text in [false, true] {
-                view.config.type_text = type_text;
-                view.typer = None;
-                view.status = Status::Copying;
-                assert!(view.prepare_delivery(Ok(()), cx).is_none());
-                assert!(matches!(view.status, Status::Idle));
-                assert_eq!(view.notice.as_deref(), Some("Copied. Paste to insert."));
-                assert!(view.error.is_none());
-                assert!(view.pill_visible());
-                view.clear_message();
-                assert!(!view.pill_visible());
-            }
-        });
+            assert_eq!(view.notice.as_deref(), Some("Copied. Paste to insert."));
+            assert!(view.error.is_none());
+            assert!(view.pill_visible());
+            view.clear_message();
+            assert!(!view.pill_visible());
+        }
     }
 
-    #[gpui::test]
-    fn shutdown_and_drop_cancel_the_clipboard_publisher(cx: &mut TestAppContext) {
+    #[test]
+    fn shutdown_and_drop_cancel_the_clipboard_publisher() {
         for shutdown in [false, true] {
-            let view = view(cx, false);
-            let cancelled = view.update(cx, |view, cx| {
-                let cancelled = Arc::new(AtomicBool::new(false));
-                view.copy_cancel = Some(cancelled.clone());
-                view.status = Status::Copying;
-                if shutdown {
-                    view.prepare_quit();
-                    assert!(view.prepare_delivery(Ok(()), cx).is_none());
-                    assert!(view.notice.is_none());
-                }
-                cancelled
-            });
+            let mut view = view(false);
+            let cancelled = Arc::new(AtomicBool::new(false));
+            view.copy_cancel = Some(cancelled.clone());
+            view.status = Status::Copying;
+            if shutdown {
+                view.prepare_quit();
+                assert!(view.prepare_delivery(Ok(())).is_none());
+                assert!(view.notice.is_none());
+            }
             drop(view);
-            cx.update(|_| {});
             assert!(cancelled.load(Ordering::Acquire));
         }
     }
 
-    /// Real GPUI/Wayland fixture, driven only by the isolated niri script.
+    /// Real Wayland fixture, driven only by the isolated niri script.
     /// Injects a completed transcript instead of microphone/network I/O.
     #[test]
     #[ignore]
@@ -1051,309 +995,252 @@ mod tests {
         let (tx, rx) = channel();
         let server = crate::ipc::listen(tx.clone()).unwrap();
         let typer = config.type_text.then(|| Typer::new().unwrap());
-        gpui::Application::new().run(move |cx| {
-            cx.set_quit_on_last_window_close(false);
-            let view = cx.new(|cx| DictationView::new(config, rx, tx, typer, None, None, cx));
-            cx.set_global(crate::DictationApp {
-                _view: view.clone(),
-            });
-            cx.spawn(async move |cx| {
-                while !trigger.exists() {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(20))
-                        .await;
-                }
-                view.update(cx, |view, cx| view.deliver_transcript(text, cx))
-                    .unwrap();
-            })
-            .detach();
+        let view = Dictation::new(config, rx, tx, typer, None, None);
+        let internal = view.internal_tx.clone();
+        let wake = view.tx.clone();
+        std::thread::spawn(move || {
+            while !trigger.exists() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            internal.send(Internal::Text(text)).unwrap();
+            wake.send(Command::Wake).unwrap();
         });
+        view.run();
         drop(server);
     }
 
-    #[gpui::test]
-    fn output_reload_applies_to_pending_and_active_delivery(cx: &mut TestAppContext) {
-        let view = view(cx, true);
-        view.update(cx, |view, _| {
-            view.status = Status::Transcribing;
-            view.apply_config_with(
-                config(false),
-                || panic!("disabled output created a typer"),
-                watcher,
-            );
-            assert!(matches!(view.status, Status::Transcribing));
-            assert!(view.begin_delivery().is_none());
+    #[test]
+    fn output_reload_applies_to_pending_and_active_delivery() {
+        let mut view = view(true);
+        view.status = Status::Transcribing;
+        view.apply_config_with(
+            config(false),
+            || panic!("disabled output created a typer"),
+            watcher,
+        );
+        assert!(matches!(view.status, Status::Transcribing));
+        assert!(view.begin_delivery().is_none());
+        assert!(matches!(view.status, Status::Idle));
+
+        view.apply_config_with(config(true), || Ok(typer()), watcher);
+        let Delivery { cancelled, .. } = view
+            .begin_delivery()
+            .expect("enabling output must create delivery");
+        view.apply_config_with(
+            config(false),
+            || panic!("disabled output created a typer"),
+            watcher,
+        );
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(!view.config.type_text);
+        assert!(view.typer.is_none());
+    }
+
+    #[test]
+    fn unavailable_delivery_fails_closed_and_can_retry() {
+        let mut view = view(false);
+        view.apply_config_with(
+            config(true),
+            || anyhow::bail!("no virtual keyboard"),
+            watcher,
+        );
+        assert!(
+            view.error
+                .as_ref()
+                .is_some_and(|message| message.contains("no virtual keyboard"))
+        );
+        assert!(view.begin_delivery().is_none());
+        view.apply_config_with(config(true), || Ok(typer()), watcher);
+        assert!(view.begin_delivery().is_some());
+    }
+
+    #[test]
+    fn hotkey_reload_cancels_capture_and_rejects_queued_old_gestures() {
+        let mut view = view(false);
+        let old = view.watcher.as_ref().unwrap().generation();
+        view.status = Status::Recording {
+            started: Instant::now(),
+            cued: false,
+        };
+        let mut new = config(false);
+        new.hotkey = "KEY_CAPSLOCK".into();
+        view.apply_config_with(new, || panic!("disabled output created a typer"), watcher);
+        let current = view.watcher.as_ref().unwrap().generation();
+        assert_ne!(current, old);
+        assert!(matches!(view.status, Status::Idle));
+        for action in [
+            crate::ipc::HotkeyCommand::Start,
+            crate::ipc::HotkeyCommand::Stop,
+            crate::ipc::HotkeyCommand::Toggle,
+        ] {
+            view.handle_command(Command::Hotkey {
+                generation: old,
+                action,
+            });
             assert!(matches!(view.status, Status::Idle));
-
-            view.apply_config_with(config(true), || Ok(typer()), watcher);
-            let Delivery { cancelled, .. } = view
-                .begin_delivery()
-                .expect("enabling output must create delivery");
-            view.apply_config_with(
-                config(false),
-                || panic!("disabled output created a typer"),
-                watcher,
-            );
-            assert!(cancelled.load(Ordering::Acquire));
-            assert!(!view.config.type_text);
-            assert!(view.typer.is_none());
+        }
+        // IPC remains independent of watcher generations, and a current
+        // gesture still reaches the normal missing-key path without a mic.
+        view.handle_command(Command::Start);
+        assert!(matches!(view.status, Status::StartFailed { .. }));
+        view.handle_command(Command::Cancel);
+        view.handle_command(Command::Hotkey {
+            generation: current,
+            action: crate::ipc::HotkeyCommand::Start,
         });
+        assert!(matches!(view.status, Status::StartFailed { .. }));
     }
 
-    #[gpui::test]
-    fn unavailable_delivery_fails_closed_and_can_retry(cx: &mut TestAppContext) {
-        let view = view(cx, false);
-        view.update(cx, |view, _| {
-            view.apply_config_with(
-                config(true),
-                || anyhow::bail!("no virtual keyboard"),
-                watcher,
-            );
-            assert!(
-                view.error
-                    .as_ref()
-                    .is_some_and(|message| message.contains("no virtual keyboard"))
-            );
-            assert!(view.begin_delivery().is_none());
-            view.apply_config_with(config(true), || Ok(typer()), watcher);
-            assert!(view.begin_delivery().is_some());
-        });
+    #[test]
+    fn correcting_initial_hotkey_failure_creates_a_watcher() {
+        let mut view = view(false);
+        view.watcher = None;
+        view.config.hotkey = "INVALID_TEST_KEY".into();
+        // Started over IPC; no hotkey gesture can be in flight.
+        view.status = Status::Recording {
+            started: Instant::now(),
+            cued: true,
+        };
+        view.apply_config_with(
+            config(false),
+            || panic!("disabled output created a typer"),
+            watcher,
+        );
+        assert!(view.watcher.is_some());
+        assert!(matches!(view.status, Status::Recording { .. }));
+        view.status = Status::Idle;
+
+        let mut invalid = config(false);
+        invalid.hotkey = "INVALID_TEST_KEY".into();
+        view.apply_config_with(
+            invalid,
+            || panic!("disabled output created a typer"),
+            watcher,
+        );
+        assert!(view.watcher.is_none());
+        assert!(view.error.is_some());
+        view.apply_config_with(
+            config(false),
+            || panic!("disabled output created a typer"),
+            watcher,
+        );
+        assert!(view.watcher.is_some());
     }
 
-    #[gpui::test]
-    fn hotkey_reload_cancels_capture_and_rejects_queued_old_gestures(cx: &mut TestAppContext) {
-        let view = view(cx, false);
-        view.update(cx, |view, cx| {
-            let old = view.watcher.as_ref().unwrap().generation();
-            view.status = Status::Recording {
-                started: Instant::now(),
-                cued: false,
-            };
-            let mut new = config(false);
-            new.hotkey = "KEY_CAPSLOCK".into();
-            view.apply_config_with(new, || panic!("disabled output created a typer"), watcher);
-            let current = view.watcher.as_ref().unwrap().generation();
-            assert_ne!(current, old);
-            assert!(matches!(view.status, Status::Idle));
-            for action in [
-                crate::ipc::HotkeyCommand::Start,
-                crate::ipc::HotkeyCommand::Stop,
-                crate::ipc::HotkeyCommand::Toggle,
-            ] {
-                view.handle_command(
-                    Command::Hotkey {
-                        generation: old,
-                        action,
-                    },
-                    cx,
-                );
-                assert!(matches!(view.status, Status::Idle));
-            }
-            // IPC remains independent of watcher generations, and a current
-            // gesture still reaches the normal missing-key path without a mic.
-            view.handle_command(Command::Start, cx);
-            assert!(matches!(view.status, Status::StartFailed { .. }));
-            view.handle_command(Command::Cancel, cx);
-            view.handle_command(
-                Command::Hotkey {
-                    generation: current,
-                    action: crate::ipc::HotkeyCommand::Start,
-                },
-                cx,
-            );
-            assert!(matches!(view.status, Status::StartFailed { .. }));
-        });
+    #[test]
+    fn start_queued_as_a_transcript_lands_is_not_dropped() {
+        let mut view = view(false);
+        view.status = Status::Transcribing;
+        view.tx.send(Command::Start).unwrap();
+        assert!(view.prepare_delivery(Ok(())).is_none());
+        // No API key in tests, so a handled Start reaches StartFailed.
+        assert!(matches!(view.status, Status::StartFailed { .. }));
     }
 
-    #[gpui::test]
-    fn correcting_initial_hotkey_failure_creates_a_watcher(cx: &mut TestAppContext) {
-        let view = view(cx, false);
-        view.update(cx, |view, _| {
-            view.watcher = None;
-            view.config.hotkey = "INVALID_TEST_KEY".into();
-            // Started over IPC; no hotkey gesture can be in flight.
-            view.status = Status::Recording {
-                started: Instant::now(),
-                cued: true,
-            };
-            view.apply_config_with(
-                config(false),
-                || panic!("disabled output created a typer"),
-                watcher,
-            );
-            assert!(view.watcher.is_some());
-            assert!(matches!(view.status, Status::Recording { .. }));
-            view.status = Status::Idle;
+    #[test]
+    fn start_during_typing_records_once_delivery_finishes() {
+        let mut view = view(true);
+        view.status = Status::Transcribing;
+        view.tx.send(Command::Start).unwrap();
+        assert!(view.prepare_delivery(Ok(())).is_some());
+        assert!(matches!(view.status, Status::Typing));
+        view.drain_commands();
+        view.finish_delivery();
+        // No API key in tests, so the started recording reaches StartFailed.
+        assert!(matches!(view.status, Status::StartFailed { .. }));
 
-            let mut invalid = config(false);
-            invalid.hotkey = "INVALID_TEST_KEY".into();
-            view.apply_config_with(
-                invalid,
-                || panic!("disabled output created a typer"),
-                watcher,
-            );
-            assert!(view.watcher.is_none());
-            assert!(view.error.is_some());
-            view.apply_config_with(
-                config(false),
-                || panic!("disabled output created a typer"),
-                watcher,
-            );
-            assert!(view.watcher.is_some());
-        });
-    }
-
-    #[gpui::test]
-    fn start_queued_as_a_transcript_lands_is_not_dropped(cx: &mut TestAppContext) {
-        let view = view(cx, false);
-        view.update(cx, |view, cx| {
-            view.status = Status::Transcribing;
-            view.tx.send(Command::Start).unwrap();
-            assert!(view.prepare_delivery(Ok(()), cx).is_none());
-            // No API key in tests, so a handled Start reaches StartFailed.
-            assert!(matches!(view.status, Status::StartFailed { .. }));
-        });
-    }
-
-    #[gpui::test]
-    fn start_during_typing_records_once_delivery_finishes(cx: &mut TestAppContext) {
-        let view = view(cx, true);
-        view.update(cx, |view, cx| {
-            view.status = Status::Transcribing;
-            view.tx.send(Command::Start).unwrap();
-            assert!(view.prepare_delivery(Ok(()), cx).is_some());
-            assert!(matches!(view.status, Status::Typing));
-            view.drain_commands(cx);
+        // A gesture that ends while still busy records nothing afterwards,
+        // even when its end is still queued as delivery finishes.
+        for (start, end) in [
+            (Command::Start, Command::Stop),
+            (Command::Start, Command::Cancel),
+            (Command::Toggle, Command::Toggle),
+        ] {
+            view.status = Status::Typing;
+            view.handle_command(start);
+            view.tx.send(end).unwrap();
+            view.drain_commands();
             view.finish_delivery();
-            // No API key in tests, so the started recording reaches StartFailed.
-            assert!(matches!(view.status, Status::StartFailed { .. }));
-
-            // A gesture that ends while still busy records nothing afterwards,
-            // even when its end is still queued as delivery finishes.
-            for (start, end) in [
-                (Command::Start, Command::Stop),
-                (Command::Start, Command::Cancel),
-                (Command::Toggle, Command::Toggle),
-            ] {
-                view.status = Status::Typing;
-                view.handle_command(start, cx);
-                view.tx.send(end).unwrap();
-                view.drain_commands(cx);
-                view.finish_delivery();
-                assert!(matches!(view.status, Status::Idle), "{start:?} {end:?}");
-            }
-        });
+            assert!(matches!(view.status, Status::Idle), "{start:?} {end:?}");
+        }
     }
 
-    #[gpui::test]
-    fn shutdown_cancels_delivery_and_blocks_later_commands(cx: &mut TestAppContext) {
-        let view = view(cx, true);
-        view.update(cx, |view, cx| {
-            let Delivery { cancelled, .. } = view.begin_delivery().unwrap();
-            view.prepare_quit();
-            assert!(cancelled.load(Ordering::Acquire));
-            assert!(view.typer.is_none());
-            assert!(view.watcher.is_none());
-            view.status = Status::Idle;
-            view.handle_command(Command::Start, cx);
-            assert!(matches!(view.status, Status::Idle));
+    /// Typing reports back through the loop: the outcome lands, and a start
+    /// held during delivery records once it finished.
+    #[test]
+    fn typed_result_finishes_delivery_through_the_loop() {
+        let mut view = view(true);
+        view.status = Status::Typing;
+        view.typing_cancel = Some(Arc::new(AtomicBool::new(false)));
+        view.handle_command(Command::Start);
+        view.handle_internal(Internal::Typed {
+            outcome: Err(anyhow::anyhow!("compositor went away")),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            chars: 3,
         });
+        assert!(view.typing_cancel.is_none());
+        assert_eq!(
+            view.error.as_deref(),
+            Some("Typing failed. Full text copied.")
+        );
+        assert!(matches!(view.status, Status::StartFailed { .. }));
     }
 
-    #[gpui::test]
-    fn dropping_the_view_cancels_inflight_delivery(cx: &mut TestAppContext) {
-        let view = view(cx, true);
-        let cancelled = view.update(cx, |view, _| view.begin_delivery().unwrap().cancelled);
+    #[test]
+    fn shutdown_cancels_delivery_and_blocks_later_commands() {
+        let mut view = view(true);
+        let Delivery { cancelled, .. } = view.begin_delivery().unwrap();
+        view.prepare_quit();
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(view.typer.is_none());
+        assert!(view.watcher.is_none());
+        view.status = Status::Idle;
+        view.handle_command(Command::Start);
+        assert!(matches!(view.status, Status::Idle));
+    }
+
+    #[test]
+    fn dropping_the_view_cancels_inflight_delivery() {
+        let mut view = view(true);
+        let cancelled = view.begin_delivery().unwrap().cancelled;
         drop(view);
-        // Entity release effects run when the app context exits its update.
-        cx.update(|_| {});
         assert!(cancelled.load(Ordering::Acquire));
     }
 
-    #[gpui::test]
-    fn queued_output_reload_precedes_delivery(cx: &mut TestAppContext) {
-        const CHILD: &str = "DICTATION_TEST_QUEUED_OUTPUT_RELOAD";
-        if std::env::var_os(CHILD).is_some() {
-            let view = view(cx, true);
-            view.update(cx, |view, cx| {
-                view.status = Status::Transcribing;
-                view.tx.send(Command::Reload).unwrap();
-                // Simulate completion before the pump's next timer tick.
-                assert!(view.prepare_delivery(Ok(()), cx).is_none());
-                assert!(!view.config.type_text);
-                assert_eq!(view.notice.as_deref(), Some("Copied. Paste to insert."));
-            });
+    #[test]
+    fn queued_output_reload_precedes_delivery() {
+        if !in_isolated_config(
+            "app::tests::queued_output_reload_precedes_delivery",
+            "DICTATION_TEST_QUEUED_OUTPUT_RELOAD",
+            "type_text = false\nbeeps = false\ncleanup = false\n",
+        ) {
             return;
         }
-
-        // An isolated child supplies its own config environment without racing
-        // other tests or reading/writing the user's real configuration.
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::create_dir(directory.path().join("dictationapp")).unwrap();
-        std::fs::write(
-            directory.path().join("dictationapp/config.toml"),
-            "type_text = false\nbeeps = false\ncleanup = false\n",
-        )
-        .unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "app::tests::queued_output_reload_precedes_delivery",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env("XDG_CONFIG_HOME", directory.path())
-            .env_remove("OPENROUTER_API_KEY")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let mut view = view(true);
+        view.status = Status::Transcribing;
+        view.tx.send(Command::Reload).unwrap();
+        // Completion arrives before the loop handled the queued Reload.
+        assert!(view.prepare_delivery(Ok(())).is_none());
+        assert!(!view.config.type_text);
+        assert_eq!(view.notice.as_deref(), Some("Copied. Paste to insert."));
     }
 
-    #[gpui::test]
-    fn malformed_config_never_opens_writable_settings(cx: &mut TestAppContext) {
-        const CHILD: &str = "DICTATION_TEST_SETTINGS_LOAD_FAILURE";
-        if std::env::var_os(CHILD).is_some() {
-            let path = Config::default_path();
-            let original = std::fs::read(&path).unwrap();
-            let view = view(cx, false);
-            view.update(cx, |view, cx| {
-                view.handle_command(Command::Settings, cx);
-                assert!(view.error.is_some());
-                assert!(cx.windows().is_empty());
-            });
-            assert_eq!(std::fs::read(path).unwrap(), original);
+    #[test]
+    fn malformed_config_never_opens_writable_settings() {
+        if !in_isolated_config(
+            "app::tests::malformed_config_never_opens_writable_settings",
+            "DICTATION_TEST_SETTINGS_LOAD_FAILURE",
+            "api_key = [malformed\n",
+        ) {
             return;
         }
-
-        // The invalid config belongs to an isolated child, never the user.
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::create_dir(directory.path().join("dictationapp")).unwrap();
-        std::fs::write(
-            directory.path().join("dictationapp/config.toml"),
-            "api_key = [malformed\n",
-        )
-        .unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "app::tests::malformed_config_never_opens_writable_settings",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env("XDG_CONFIG_HOME", directory.path())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let path = Config::default_path();
+        let original = std::fs::read(&path).unwrap();
+        let mut view = view(false);
+        view.handle_command(Command::Settings);
+        assert!(view.error.is_some());
+        assert!(view.settings.is_none());
+        assert_eq!(std::fs::read(path).unwrap(), original);
     }
 
     #[test]

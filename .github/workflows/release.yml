@@ -47,16 +47,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      - uses: oven-sh/setup-bun@v2
+
       - name: Build
-        run: cargo build --release --locked
+        run: |
+          cargo build --release --locked
+          cd ui && bun install --frozen-lockfile && bun run build
 
       - name: Package
         run: |
           mkdir -p dist
           tar -czf "dist/dictationapp-${GITHUB_REF_NAME}-x86_64-linux-gnu.tar.gz" \
-            -C target/release dictationapp \
+            -C target/release dictationapp dictationapp-ui \
             -C "$GITHUB_WORKSPACE" LICENSE README.md \
-            packaging/dictationapp-settings.desktop vendor/gpui/LICENSE-APACHE
+            packaging/dictationapp-settings.desktop ui/node_modules/@gpuix/native/LICENSE
           (cd dist && sha256sum *.tar.gz > sha256sums.txt)
 
       - name: Create GitHub release
