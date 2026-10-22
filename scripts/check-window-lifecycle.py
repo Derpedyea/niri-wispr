@@ -56,9 +56,17 @@ def nested(binary, state):
         def command(flag):
             subprocess.run([binary, flag], env=env, check=True, timeout=5)
 
-        def windows(title):
+        def settings():
             return [w for w in json.loads(niri("-j", "windows"))
-                    if w["pid"] == app.pid and w["title"] == title]
+                    if w["app_id"] == "dictationapp" and w["title"] == "Dictation Settings"]
+
+        def pill():
+            return [layer for layer in json.loads(niri("-j", "layers"))
+                    if layer["namespace"] == "dictationapp-pill"]
+
+        def any_surface():
+            return bool(pill()) or any(w["app_id"] == "dictationapp"
+                                       for w in json.loads(niri("-j", "windows")))
 
         wait_for("IPC ready", lambda: bool(list(runtime.glob("dictationapp-*.sock"))))
         executable = Path(f"/proc/{app.pid}/exe")
@@ -68,26 +76,30 @@ def nested(binary, state):
         report("PASS executing test binary sha256=" + digest)
         command("--reload")
         wait_for("command pump ready", lambda: "handling Reload" in log_path.read_text())
-        assert not windows("Dictation"), "Idle Dictation leaves a native window mapped"
-        report("PASS no idle window")
+        assert not any_surface(), "Idle Dictation leaves a surface mapped"
+        report("PASS no idle surface")
 
         for dismissal in ("reload", "expiry"):
             command("--start")
-            wait_for("message opens a pill", lambda: bool(windows("Dictation")))
+            wait_for("message opens a pill", lambda: bool(pill()))
             if dismissal == "reload":
                 command("--reload")
-            wait_for(f"{dismissal} removes the pill", lambda: not windows("Dictation"))
+            wait_for(f"{dismissal} removes the pill", lambda: not pill())
 
         command("--settings")
-        wait_for("settings opens without a pill", lambda: bool(windows("Dictation Settings")))
-        window_id = windows("Dictation Settings")[0]["id"]
+        wait_for("settings opens", lambda: bool(settings()))
+        assert not pill(), "Settings opened a pill"
+        command("--settings")
+        time.sleep(.5)
+        assert len(settings()) == 1, "A second --settings stacked another window"
+        report("PASS second --settings reuses the window")
+        window_id = settings()[0]["id"]
         niri("action", "close-window", "--id", str(window_id))
-        wait_for("settings closes", lambda: not windows("Dictation Settings"))
+        wait_for("settings closes", lambda: not settings())
         command("--start")
-        wait_for("daemon reopens pill after its last window closes",
-                 lambda: bool(windows("Dictation")))
+        wait_for("daemon reopens pill after its last window closes", lambda: bool(pill()))
         command("--reload")
-        wait_for("idle removes the reopened pill", lambda: not windows("Dictation"))
+        wait_for("idle removes the reopened pill", lambda: not any_surface())
         command("--quit")
         assert app.wait(timeout=5) == 0, "Explicit quit failed"
         report("PASS explicit quit")
@@ -121,15 +133,6 @@ def main():
         config.write_text('''
 hotkey-overlay { skip-at-startup; }
 animations { off; }
-window-rule {
-    match app-id="dictationapp" title="^Dictation$"
-    open-floating true
-    open-focused false
-    min-width 320
-    max-width 320
-    min-height 64
-    max-height 64
-}
 ''')
         env = dict(os.environ, DICTATION_TEST_PARENT_NIRI=os.environ.get("NIRI_SOCKET", ""),
                    DISABLE_GAMESCOPE_WSI="1", WINIT_UNIX_BACKEND="x11")

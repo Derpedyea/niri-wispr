@@ -1,0 +1,19 @@
+{
+  "name": "dictationapp-ui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build --compile src/compiled.ts --outfile ../target/release/dictationapp-ui",
+    "install-local": "bun build --compile src/compiled.ts --outfile \"$HOME/.cargo/bin/dictationapp-ui\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@gpuix/react": "0.11.0",
+    "react": "^19.2.4"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "@types/react": "^19.2.0",
+    "typescript": "^5.3.0"
+  }
+}

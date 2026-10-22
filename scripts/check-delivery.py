@@ -117,6 +117,11 @@ def nested(test_binary, app_binary, state, evidence, before):
     def windows():
         return json.loads(niri("-j", "windows"))
 
+    def pill():
+        # A bottom-anchored layer-shell overlay: the compositor places it.
+        return any(layer["namespace"] == "dictationapp-pill"
+                   for layer in json.loads(niri("-j", "layers")))
+
     def page_focused():
         window = json.loads(niri("-j", "focused-window"))
         return window and window["title"] == "Delivery check"
@@ -210,11 +215,11 @@ def nested(test_binary, app_binary, state, evidence, before):
             if before:
                 wait_for("baseline delivery completed", lambda: "fixture delivered" in log_path.read_text())
                 assert clipboard() == PREVIOUS, "Baseline unexpectedly exported transcript"
-                assert not any(w["title"] == "Dictation" for w in windows())
+                assert not pill()
                 report("PASS reproduced baseline: clipboard unchanged, no completion notice")
             elif name == "copy-failure":
                 wait_for("copy failure reported", lambda: "clipboard:" in log_path.read_text())
-                wait_for("copy error visible", lambda: any(w["title"] == "Dictation" for w in windows()))
+                wait_for("copy error visible", lambda: pill())
                 assert clipboard() == PREVIOUS
                 assert reports[index + 1] == "", "Failed copy typed text"
             else:
@@ -224,13 +229,13 @@ def nested(test_binary, app_binary, state, evidence, before):
                     wait_for("transcript inserted", lambda: reports[index + 1] == text)
                 elif name == "typing-failure":
                     wait_for("typing failure reached", lambda: "typing:" in log_path.read_text()
-                             and any(w["title"] == "Dictation" for w in windows()))
+                             and pill())
                     assert reports[index + 1] == ""
                     report("PASS full transcript survives typing failure")
                 else:
-                    wait_for("copied notice visible", lambda: any(w["title"] == "Dictation" for w in windows()))
+                    wait_for("copied notice visible", lambda: pill())
             assert page_focused(), "Delivery stole target focus"
-            assert all(w["title"] in {"Delivery check", "Dictation"} for w in windows()), "Helper window mapped"
+            assert all(w["title"] == "Delivery check" for w in windows()), "Helper window mapped"
             report(f"PASS {name}: target retains focus, no helper window")
             if name == "clipboard-only":
                 subprocess.run([test_binary, "--ignored", "--exact",
@@ -240,23 +245,22 @@ def nested(test_binary, app_binary, state, evidence, before):
                 expected = PREVIOUS if before else text
                 wait_for("browser pastes clipboard", lambda: reports[index + 1] == expected)
                 if not before:
-                    wait_for("notice placed at bottom", lambda: any(
-                        w["title"] == "Dictation" and
-                        w["layout"]["tile_pos_in_workspace_view"][1] > 500 for w in windows()))
+                    wait_for("notice visible", pill)
+                    time.sleep(.3)
                 # niri's screenshot action replaces the clipboard with its PNG.
                 # Capture only after proving native clipboard read and paste.
                 snapshot("before.png" if before else "after.png")
             if name == "copy-failure":
-                wait_for("error placed at bottom", lambda: any(
-                    w["title"] == "Dictation" and
-                    w["layout"]["tile_pos_in_workspace_view"][1] > 500 for w in windows()))
+                wait_for("error visible", pill)
+                # Listed once created; give it a frame to paint for the evidence shot.
+                time.sleep(.3)
                 snapshot("copy-failure.png")
             if name == "typing-failure":
-                wait_for("typing error placed at bottom", lambda: any(
-                    w["title"] == "Dictation" and
-                    w["layout"]["tile_pos_in_workspace_view"][1] > 500 for w in windows()))
+                wait_for("typing error visible", pill)
+                # Listed once created; give it a frame to paint for the evidence shot.
+                time.sleep(.3)
                 snapshot("typing-failure.png")
-            wait_for("idle removes native pill", lambda: not any(w["title"] == "Dictation" for w in windows()))
+            wait_for("idle removes the pill", lambda: not pill())
             if recorder is not None:
                 frame = recorded_frames()
                 wait_for("idle frame recorded", lambda: recorded_frames() > frame + 3)
@@ -308,15 +312,6 @@ def main():
         config = state / "niri.kdl"
         config.write_text('''hotkey-overlay { skip-at-startup; }
 animations { off; }
-window-rule {
-    match app-id="dictationapp" title="^Dictation$"
-    open-floating true
-    open-focused false
-    min-width 320
-    max-width 320
-    min-height 64
-    max-height 64
-}
 ''')
         env = dict(os.environ, DICTATION_TEST_PARENT_NIRI=os.environ.get("NIRI_SOCKET", ""),
                    DICTATION_TEST_PARENT_DISPLAY=os.environ.get("DISPLAY", ""),

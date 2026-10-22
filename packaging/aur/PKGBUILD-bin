@@ -22,17 +22,19 @@ depends=(
   'wl-clipboard'
 )
 optdepends=(
-  'niri: positions the pill at the bottom-center of the output'
   'pipewire: audio cues via pw-play'
   'libpulse: audio cues via paplay'
   'alsa-utils: audio cues via aplay'
 )
 source=("dictationapp-v$pkgver-x86_64-linux-gnu.tar.gz::https://github.com/Derpedyea/niri-wispr/releases/download/v$pkgver/dictationapp-v$pkgver-x86_64-linux-gnu.tar.gz")
 sha256sums=('SKIP')
+# The UI is a Bun single-file executable; stripping it removes the app.
+options=('!strip')
 
 package() {
   install -Dm755 dictationapp "$pkgdir/usr/bin/dictationapp"
   install -Dm644 packaging/dictationapp-settings.desktop -t "$pkgdir/usr/share/applications/"
   install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
-  install -Dm644 vendor/gpui/LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/GPUI-LICENSE-APACHE"
+  install -Dm755 dictationapp-ui -t "$pkgdir/usr/lib/dictationapp/"
+  install -Dm644 ui/node_modules/@gpuix/native/LICENSE "$pkgdir/usr/share/licenses/$pkgname/GPUIX-LICENSE-APACHE"
 }

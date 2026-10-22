@@ -40,7 +40,12 @@ paru -S dictationapp       # build from source
 git clone https://github.com/Derpedyea/niri-wispr
 cd niri-wispr
 cargo install --path .     # installs to ~/.cargo/bin/dictationapp
+cd ui && bun install && bun run install-local   # the windows: ~/.cargo/bin/dictationapp-ui
 ```
+
+The pill and Settings are [GPUIX](https://github.com/remorses/gpuix) (React on
+Zed's GPUI) apps in `ui/`, compiled with [Bun](https://bun.sh) into one
+`dictationapp-ui` executable that the daemon starts per window.
 
 To start it with niri:
 
@@ -50,8 +55,8 @@ spawn-at-startup "~/.cargo/bin/dictationapp"
 
 ## Requirements
 
-- **Wayland** — developed on niri; the pill positions itself via `niri msg`
-  (a graceful no-op on other compositors)
+- **Wayland with layer-shell** (niri, sway, Hyprland, …) — the pill is a
+  bottom-anchored overlay surface
 - **An OpenRouter API key** — set it in the settings window, in
   `config.toml`, or via `OPENROUTER_API_KEY`
 - **Read access to `/dev/input/event*`** — for the global hotkey
@@ -131,24 +136,12 @@ hotkey in a shortcut (Right Ctrl+C) never starts a dictation.
 
 ## niri setup
 
-Two window rules make the pill behave like an overlay. They're matched by
-`app-id` and title (both set in code, so rules only need to match):
+The pill needs no rules: it's a layer-shell overlay (namespace
+`dictationapp-pill`) anchored to the bottom of the focused output, it never
+takes keyboard focus, and it exists only while active or showing a message.
+Settings is an ordinary window; this rule floats it:
 
 ```kdl
-// Pill — exists only while active or showing a message; opens without focus
-window-rule {
-    match app-id="dictationapp" title="^Dictation$"
-    open-floating true
-    open-focused false
-    min-width 320
-    max-width 320
-    min-height 64
-    max-height 64
-    // Optional: disable effects around the pill's transparent margins:
-    // blur off, focus ring / border off
-}
-
-// Settings — an ordinary centered floating window
 window-rule {
     match app-id="dictationapp" title="Dictation Settings"
     open-floating true
@@ -159,10 +152,8 @@ window-rule {
 }
 ```
 
-The min/max pinning keeps the floating pill at its intended size. It appears
-at the bottom-center of the focused monitor/workspace each time it opens.
-When idle, there is no window to cover buttons underneath it, including
-after maximizing another app.
+When idle there is no pill process at all, so nothing can cover buttons
+underneath it.
 
 An optional compositor-level toggle:
 
@@ -236,30 +227,30 @@ release still happens.
 cargo build                    # debug binary at target/debug/dictationapp
 cargo test                     # deterministic tests; no desktop input
 cargo test -- --ignored        # opt-in hardware/input + network tests
+cd ui && bun install && bun run typecheck   # debug builds run ui/src with bun
 python3 scripts/test-aur-publish.py  # mocked publishing; no network or credentials
 ```
 
-Rust + [gpui](https://github.com/zed-industries/zed) (UI), cpal (audio),
-hound (WAV), evdev/uinput (hotkey + typing), ureq (HTTP).
-
-GPUI 0.2.2 is vendored with a small Linux lifetime patch so closing the last
-window does not shut down the background hotkey/IPC service. See
-[vendor/gpui/PATCHES.md](vendor/gpui/PATCHES.md) for provenance and the patch,
-and [docs/window-lifecycle.md](docs/window-lifecycle.md) for native verification.
+Rust daemon: cpal (audio), hound (WAV), evdev/uinput (hotkey + typing), ureq
+(HTTP). Windows: [GPUIX](https://github.com/remorses/gpuix) React apps in
+`ui/`, one process per window, driven over stdin/stdout. See
+[docs/window-lifecycle.md](docs/window-lifecycle.md) for native verification.
 
 | File | Role |
 | --- | --- |
-| `main.rs` | CLI dispatch, GPUI bootstrap, wiring |
-| `app.rs` | pill UI, state machine (Idle → Recording → Transcribing → Cleaning → Typing) |
+| `main.rs` | CLI dispatch, wiring |
+| `app.rs` | command loop + state machine (Idle → Recording → Transcribing → Cleaning → Typing), pill view |
+| `ui.rs` | starts window processes, JSON views in / events out |
+| `ui/src/` | the pill and Settings in React (GPUIX) |
 | `audio.rs` | mic capture + WAV encode |
 | `api.rs` | OpenRouter transcription + cleanup pass |
 | `hotkey.rs` | evdev global hotkey watcher |
 | `typer.rs` | Unicode insertion through a Wayland virtual keyboard |
 | `ipc.rs` | Ordered CLI commands, acknowledgements, and lifetime-held instance lock |
-| `settings.rs` | settings window |
+| `settings.rs` | settings model: saves, reloads, key capture |
 | `tray.rs` | tray icon in the bar |
 | `beep.rs` | audio cues |
-| `niri.rs` | pill positioning via `niri msg` |
+| `niri.rs` | focuses Settings via `niri msg` |
 | `config.rs` | config.toml load/save |
 | `packaging/aur/` | PKGBUILDs + the AUR publish script |
 
@@ -267,5 +258,5 @@ and [docs/window-lifecycle.md](docs/window-lifecycle.md) for native verification
 
 [MIT](LICENSE) © Derpedyea
 
-Vendored GPUI is © Zed Industries, Inc., licensed under
-[Apache-2.0](vendor/gpui/LICENSE-APACHE).
+`dictationapp-ui` bundles GPUIX (Apache-2.0, which includes Zed's GPUI),
+React (MIT) and the Bun runtime.

@@ -1,45 +1,38 @@
 # Idle windows and native verification
 
-Idle Dictation must have **no native pill window**. Transparency is not enough:
+Idle Dictation must have **no pill surface**. Transparency is not enough:
 the old 320×64 floating toplevel covered other apps' controls, particularly
 after maximizing them in niri. Even an empty Wayland input region left niri's
 tile activation rectangle able to take focus and consume clicks.
 
-The command pump keeps the model alive independently of windows. It opens a
-pill for recording, processing, or a timed message, then removes that window
-when idle. Window creation happens outside the entity update because GPUI
-immediately renders the root view. The small vendored GPUI lifetime opt-out
-keeps the Linux event loop alive after closing the last window. Explicit quit
-and manually closing the visible pill still exit; closing Settings does not.
+Windows are separate GPUIX processes (`ui/`), one window each, so a window
+exists exactly as long as its process. The daemon starts the pill process
+when capture starts (to hide its ~100ms startup), sends the first view when
+the recording is cued, and kills it once idle. The pill is a layer-shell
+overlay with no keyboard interactivity, placed by the compositor. Settings is
+an ordinary toplevel; closing it ends only its process. Explicit `--quit`
+stops the daemon, which kills any window processes.
 
 ## Automated native check
 
-Requires Python 3, niri, gamescope, and a working Vulkan driver:
+Requires Python 3, niri, gamescope, Bun (`cd ui && bun install`) and a working
+Vulkan driver:
 
 ```sh
 cargo build --locked
 python3 scripts/check-window-lifecycle.py target/debug/dictationapp
+# the compiled windows instead of ui/src:
+(cd ui && bun run build)
+DICTATIONAPP_UI=$PWD/target/release/dictationapp-ui python3 scripts/check-window-lifecycle.py target/debug/dictationapp
 ```
 
 This starts a separate niri inside headless gamescope. It uses temporary IPC
 and configuration directories, disables the hotkey, sound and text injection,
 and clears the API key. `--start` therefore shows the real missing-key message
-without recording or contacting a service. The check verifies no idle window,
-repeated message-window creation/removal, timed dismissal, survival after the
-last Settings window closes, and explicit quit. It never moves the real
+without recording or contacting a service. The check verifies no idle surface,
+repeated pill creation/removal, timed dismissal, one reused Settings window,
+survival after Settings closes, and explicit quit. It never moves the real
 desktop pointer or changes the user's settings.
 
-The installed pre-fix binary fails the initial no-window assertion. The
-correct seam is the actual compositor window list and process lifetime, not
-a unit test of `pill_visible()`.
-
-## Original click reproduction
-
-The fix was also checked with Lords' actual Build/Zoning controls inside the
-isolated compositor, using native Wayland virtual-pointer presses. The game
-was maximized from a half-width column with 125% monitor scaling, 70% UI scale,
-and 50% render scale. The old binary captured clicks and took focus over the
-toolbar while idle. With the fix, six idle-state toolbar clicks across three
-idle periods reached the game and retained focus; two visible-pill clicks
-correctly reached Dictation. Closing the last Settings window left the daemon
-running, and `--quit` terminated it. Result: eight native clicks, zero failures.
+The correct seam is the compositor's actual window and layer lists and
+process lifetime, not a unit test of `pill_visible()`.

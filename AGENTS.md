@@ -10,12 +10,22 @@ cargo build                    # debug binary at target/debug/dictationapp
 cargo install --path .         # release install to ~/.cargo/bin/dictationapp
 cargo test                     # deterministic tests; no desktop input
 cargo test -- --ignored        # opt-in hardware/input + network tests
+cd ui && bun install           # once; debug builds then run ui/src with bun
+cd ui && bun run typecheck
+cd ui && bun run build         # target/release/dictationapp-ui, beside the release binary
+cd ui && bun run install-local # ~/.cargo/bin/dictationapp-ui, beside cargo install
+python3 scripts/check-window-lifecycle.py target/debug/dictationapp  # headless niri
 ```
+
+Windows are found as `$DICTATIONAPP_UI`, else `dictationapp-ui` beside the
+executable, else `/usr/lib/dictationapp/dictationapp-ui`; debug builds fall back
+to `bun ui/src/main.tsx`. Never `strip` it: a stripped Bun executable is plain bun.
 
 ## Releasing
 
 Push a `v*` tag matching Cargo.toml's version → `.github/workflows/release.yml`
-builds on ubuntu-22.04, creates a GitHub release (x86_64 tarball + checksums),
+builds on ubuntu-22.04 (cargo + `bun run build` in `ui/`), creates a GitHub
+release (x86_64 tarball with `dictationapp` + `dictationapp-ui`, checksums),
 then the `aur` job runs `packaging/aur/publish.sh` inside `archlinux:base-devel`
 to update the `dictationapp` + `dictationapp-bin` AUR packages (clone or init
 repo, fill pkgver/sha256, `makepkg --printsrcinfo` as unprivileged `builder`,
@@ -30,18 +40,31 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
 
 ## Architecture
 
-- `main.rs` — CLI dispatch (`--toggle/--start/--stop/--cancel/--quit`), GPUI app bootstrap,
-  wires channel → IPC listener + evdev hotkey + Wayland typer + tray icon; retains the view
-  in an app global so the service stays alive without any windows.
-- `app.rs` — GPUI pill UI + command pump (`cx.spawn` + `timer` poll of `mpsc::Receiver`),
-  state machine Idle → Recording → Transcribing → Cleaning → Typing. Capture starts on Start,
-  but the beep and pill — or a start failure (no API key, no mic) — wait `hotkey::MIN_HOLD`
-  (250ms), so taps and shortcuts the hotkey cancels before then stay invisible. Creates the pill
-  only while active or showing a message, and removes the native window when idle.
+- `main.rs` — CLI dispatch (`--toggle/--start/--stop/--cancel/--quit`), wires channel →
+  IPC listener + evdev hotkey + Wayland typer + tray icon, then runs `Dictation` on the
+  main thread until `Quit`. No GUI toolkit in the daemon.
+- `app.rs` — the command loop (`recv_timeout` on the `Command` channel, 40ms tick for cues,
+  waveform, message expiry) + state machine Idle → Recording → Transcribing → Cleaning →
+  Typing. Network/clipboard/typing work runs on threads that hand an `Internal` result
+  back and send `Command::Wake`. Capture starts on Start, but the beep and pill — or a
+  start failure (no API key, no mic) — wait `hotkey::MIN_HOLD` (250ms), so taps and
+  shortcuts the hotkey cancels before then stay invisible. The pill process starts warm
+  with capture and opens its window on the first view at the cue; it's killed when idle.
   A start during Transcribing/Cleaning/Typing is held and records once delivery ends,
   unless its gesture (release, `--stop`, second toggle) ends first.
-  Active recording shows a 21-sample waveform from measured input levels. Window creation
-  runs outside the view update because opening a GPUI window renders its root immediately.
+  Active recording shows a 21-sample waveform from measured input levels.
+- `ui.rs` — window processes: `dictationapp-ui <pill|settings>` gets one JSON view per line
+  on stdin and answers JSON events on stdout (non-JSON stdout lines are logged). A writer
+  thread with a small queue keeps a stalled window from blocking the loop; unchanged views
+  aren't resent. Dropping a `Window` kills its process.
+- `ui/` — Bun + [GPUIX](https://github.com/remorses/gpuix) (React → Zed's GPUI) windows:
+  `pill.tsx` (layer-shell overlay, namespace `dictationapp-pill`, anchored bottom with an
+  80px margin, keyboard interactivity none), `settings.tsx` (a view of `settings.rs`; text
+  fields keep local state while focused so late views can't rewind typing), `link.ts`
+  (pipe protocol; reroutes `console.log` to stderr), `compiled.ts` + `native.ts` (the
+  `--compile` entry embeds the renderer addon, which napi-rs's dynamic require hides from
+  the bundler; running sources, Bun refuses that import, so `main.tsx` stays without it). GPUIX is one
+  window per process and exits when its window closes — the reason for the process model.
 - `audio.rs` — cpal capture to mono f32 + hound WAV encode. `mic` config selects the input
   device by name (exact, else case-insensitive substring; unset = system default) through
   `match_mic`, which the settings picker shares so both agree on which device "USB" means.
@@ -73,22 +96,21 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
   client with `scripts/check-typing.py` (headless niri + Chrome).
 - `beep.rs` — start/stop/error audio cues; WAVs generated once into `dirs::cache_dir()/dictationapp`,
   played via pw-play/paplay/aplay. `beeps = false` in config disables.
-- `niri.rs` — moves the pill to bottom-center of the **focused** output via `niri msg`
-  (niri 26.04's `default-floating-position` doesn't honor edge anchors here — verified visually).
-  Places each newly opened pill and repositions when recording reuses a visible one,
-  so it follows the monitor the user is looking at:
-  cross-output via `move-window-to-monitor` (lands on the focused workspace), same-output
-  via `move-window-to-workspace` (index resolves on the window's own output). Note:
-  `move-floating-window` y is relative to the work area below any top-bar strut.
-- `settings.rs` — second gpui window (`dictationapp --settings`, tray click): shortcut (set by
+- `niri.rs` — focuses the open Settings window by pid + title (a second open has no input
+  serial, so niri would ignore its activation) and reports the focused window's pid, which
+  a pending key capture checks. The pill needs nothing: niri puts a new layer surface on
+  the focused output. A pill kept visible across recordings (a notice, then a new
+  recording) stays on the output it opened on.
+- `settings.rs` — Settings model + `Session` (`dictationapp --settings`, tray click): shortcut (set by
   pressing the key; letters/Space are rejected), mode, mic, API key, model presets + Custom,
   language, cleanup, typing, sounds. Every change saves at once and sends `Command::Reload`;
   there is no Save button. Edits file values only (`Config::load_file`), so an
-  `OPENROUTER_API_KEY` is shown read-only and never written into the file. Rereads the file and
-  re-lists mics whenever the window is focused or reopened (the one window is reused), so
-  outside edits aren't overwritten and new mics appear; an unreadable file pauses saving.
-  `focus_field` is the only way to focus a text field and ends any pending key capture. One window: a second open focuses it via
-  `niri msg action focus-window`.
+  `OPENROUTER_API_KEY` is shown read-only and never written into the file. GPUIX reports no
+  window activation, so: rereads the file when its mtime moves away from the last read/save
+  here (checked each second) or on reopen, and re-lists mics every 2s on a thread — outside
+  edits aren't overwritten and new mics appear; an unreadable file pauses saving. A text
+  field taking focus (`editing` event) ends any pending key capture, and so does niri
+  focusing another window. One window: a second open focuses it via `niri msg`.
 - `tray.rs` — StatusNotifierItem via `ksni` (blocking API on the async-io zbus already in the
   tree). Symbolic mic icon, which Noctalia tints to its bar color; while a cued recording
   runs, status NeedsAttention + a procedurally drawn red-mic *pixmap* — Noctalia tints every
@@ -100,16 +122,11 @@ Runtime logs go to stderr (`recording started`, `transcript:`, `typed N chars`, 
 
 ## System integration (niri)
 
-`~/.config/niri/cfg/rules.kdl` — two window-rules on `app-id="dictationapp"`, distinguished
-by **title** (`window.set_window_title` is required — `titlebar.title` alone never reaches
-the toplevel on Wayland):
-- `title="^Dictation$"` (the pill): `open-floating true`, `open-focused false`,
-  `min/max-width 320`, `min/max-height 64`, plus `blur false` and disabled focus ring/border.
-  The effect overrides the global blur rule around the visible pill's transparent margins.
-  Min/max pinning is required because niri does not honor the
-  client's requested size for floating windows.
-- `title="Dictation Settings"`: `open-floating true`, `min/max 460x760` (floats open centered).
-  The layout is sized to fit 760px with ~3 mics; more scroll.
+`~/.config/niri/cfg/rules.kdl` — one window-rule, `app-id="dictationapp"`
+`title="Dictation Settings"`: `open-floating true`, `min/max 460x760` (floats open centered).
+The layout is sized to fit 760px with ~3 mics; more scroll. The pill is a layer surface
+(`layer-rule` matches `namespace="dictationapp-pill"` if effects ever need overriding); old
+`title="^Dictation$"` window-rules are now inert.
 
 `~/.config/niri/cfg/keybinds.kdl` — no dictation bind (a `Super+D` toggle was removed: stray
 toggles caused invisible recordings). Re-add a `spawn ".../dictationapp" "--toggle"` inside the
@@ -127,13 +144,14 @@ toggles caused invisible recordings). Re-add a `spawn ".../dictationapp" "--togg
   by opt-in hardware tests.
 - Chromium truncates keysyms past U+FFFF, so typed emoji arrive mangled there
   (any keyboard-based typer does this); the clipboard copy is exact.
-- Never leave an alpha-zero idle toplevel mapped: it blocks underlying buttons and steals
-  focus on niri, even with an empty Wayland input region. Idle must mean no pill window.
-- GPUI 0.2.2 normally exits when its last Linux window closes. `vendor/gpui` adds an opt-out;
-  `main.rs` disables automatic exit and keeps the model alive independently of windows.
-  Preserve explicit `--quit` and manual pill-close behavior. See `vendor/gpui/PATCHES.md`
-  and `docs/window-lifecycle.md` before updating GPUI or changing window lifetime.
-- The pill opens without focus so typed text lands in the previously focused app.
+- Never leave an idle surface mapped: an alpha-zero toplevel blocked underlying buttons and
+  stole focus on niri, even with an empty input region. Idle must mean no pill process.
+  See `docs/window-lifecycle.md` before changing window lifetime.
+- The pill never takes keyboard focus so typed text lands in the previously focused app.
+- `niri msg layers` lists a layer surface before its first frame; wait a frame before
+  screenshotting one.
+- Headless checks isolate `XDG_RUNTIME_DIR`, which hides PipeWire; set
+  `PIPEWIRE_RUNTIME_DIR`/`PULSE_RUNTIME_PATH` to the real one to record there.
 - `type_text = false` in config → clipboard-only mode.
 - The hotkey watcher rescans /dev/input every second, so hot-plugged or
   suspend/resume-recreated keyboards are picked up within ~1s; devices that fail

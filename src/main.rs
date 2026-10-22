@@ -10,19 +10,11 @@ mod niri;
 mod settings;
 mod tray;
 mod typer;
+mod ui;
 
-use app::DictationView;
-use gpui::{App, AppContext, Application, Entity, Global, KeyBinding, actions};
+use app::Dictation;
 use ipc::Command;
 use std::sync::mpsc::channel;
-
-actions!(dictation, [Toggle, Cancel, Quit]);
-
-// Keep the command/audio state alive while no pill or settings window is open.
-struct DictationApp {
-    _view: Entity<DictationView>,
-}
-impl Global for DictationApp {}
 
 fn usage() -> ! {
     eprintln!(
@@ -172,20 +164,7 @@ fn main() {
         }
     };
 
-    let tx2 = tx.clone();
-    Application::new().run(move |cx: &mut App| {
-        cx.bind_keys([
-            KeyBinding::new("space", Toggle, None),
-            KeyBinding::new("enter", Toggle, None),
-            KeyBinding::new("escape", Cancel, None),
-            KeyBinding::new("ctrl-q", Quit, None),
-        ]);
-
-        cx.set_quit_on_last_window_close(false);
-        let view =
-            cx.new(|cx| DictationView::new(config.clone(), rx, tx2, typer, watcher, tray, cx));
-        cx.set_global(DictationApp { _view: view });
-    });
+    Dictation::new(config, rx, tx, typer, watcher, tray).run();
     beep::shutdown();
     // Release the single-instance lock only after the app has stopped.
     drop(server);
